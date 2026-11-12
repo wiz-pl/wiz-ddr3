@@ -87,5 +87,5 @@ Recorded as the work goes (agent ddr3, from 2026-11-12). Design notes:
   **not yet simulated or rebuilt**: rerun `ddr3 sim 30000` and `ddr3 bit` first. Not
   loaded on the board (no board slot requested).
 * D3b (proofs/SchedProof.wiz): the machine, monitor, BFS and soundness lemmas are
-  written; the kernel check was still running when work stopped. D3c (`ddr3 vsim`, Icarus
+  written; the kernel check has not run yet (it was queued for heavy when work stopped). D3c (`ddr3 vsim`, Icarus
   + Micron + unisims) is written but has not been run.
