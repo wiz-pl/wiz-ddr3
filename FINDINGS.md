@@ -108,3 +108,17 @@ Recorded as the work goes (agent ddr3, from 2026-11-12). Design notes:
 * A fabric tap on an input that also feeds an IDELAYE2 can't be built: nextpnr routes it
   through the IDELAY as FIXED, and fasm2frames rejects it (FasmInconsistentBits: TYPE_FIXED
   against TYPE_VAR_LOAD).
+
+## Root cause of the zero reads (found 2026-11-12): RST tied high (our bug)
+
+* `X7.oserdes` (lib/Hdl/Xilinx7.wiz, #240) packed OCE, RST, T1 and TCE into one bus with
+  `cat` and got the order backwards: OCE=1, **RST=1**, T1=rst, TCE=t. Every OSERDESE2
+  sat in reset, so there was no CK, no commands and no DQ. A 20-line plain-Verilog OSERDESE2
+  (LiteX's instance) blinked LD4 on the board, which put the fault in our netlist and ruled
+  out the open flow. Fixed: each control is its own leaf, and the hdl test checks
+  `.OCE(1'd1), .RST(1'd0), .T1(r), .TCE(1'd1)`.
+* Ruled out on the way: IDELMUXE3 (openXC7/nextpnr-xilinx#165, adding P0 or P1 changed
+  nothing), VREF/STEPDOWN/IN_TERM (present), SING-tile aliasing (H5, G6 and the DQs are not
+  SING), CE1/SR routing (present), PLL lock (locked).
+* Lesson for #240: positional port order is fragile. Making a Prim's ports a named record,
+  so that a swap is a type error, would be better (not done).

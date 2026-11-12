@@ -65,7 +65,7 @@ def Phy.out {r : HwTy → Type} [Hw r] (fast : r HwTy.clock) (rst : r Bit) (d : 
 -- DQ j: written from the burst, read back through the IDELAY of its lane: its pad, its
 -- raw word, and its input buffer's output itself (a diagnostic)
 def Phy.dq {r : HwTy → Type} [Hw r] (c : PhyClk r) (rst : r Bit) (d : Dfi r) (j : Nat) : r (HwTy.prod (HwTy.inout 1) (HwTy.prod (B 8) Bit)) :=
-  let ser := Phy.ser c.sys4x rst (U.ofBits (fun (b : Nat) => U.bit d.wrdata (b * 16 + j)) 8) (U.bnot d.dqOe);
+  let ser := Phy.ser c.sys4x rst (U.ofBits (fun (b : Nat) => U.bit d.serDq (b * 16 + j)) 8) (U.bnot d.serOe);
   let io := X7.iobufT (Hw.fst ser) (Hw.snd ser);
   let tap := match Nat.lt j 8 with
     | .true => d.tap0
@@ -80,7 +80,7 @@ def Phy.raw {r : HwTy → Type} [Hw r] (qs : Nat → r (B 8)) : r (B 128) :=
 
 -- DQS l: 01010101 (D1 first) while writing, low in the pre- and postamble cycles
 def Phy.dqs {r : HwTy → Type} [Hw r] (c : PhyClk r) (rst : r Bit) (d : Dfi r) : r (HwTy.prod Bit (HwTy.prod (HwTy.inout 1) (HwTy.inout 1))) :=
-  let ser := Phy.ser c.sys4xDqs rst (Hw.mux d.dqsOn (Hw.lit 8 85) (Hw.lit 8 0)) (U.bnot d.dqsOe);
+  let ser := Phy.ser c.sys4xDqs rst d.serDqs (U.bnot d.serOe);
   X7.iobufdsT (Hw.fst ser) (Hw.snd ser)
 
 -- The PHY: the pads, and what comes back (`raw` before its register; `rdy`, the
@@ -97,7 +97,7 @@ def Phy.io {r : HwTy → Type} [Hw r] (c : PhyClk r) (rst : r Bit) (rstN : r Bit
     (Phy.out c.sys4x rst (Phy.cmd8 d.ras_n)) (Phy.out c.sys4x rst (Phy.cmd8 d.cas_n)) (Phy.out c.sys4x rst (Phy.cmd8 d.we_n))
     (Pads.of (fun (k : Nat) => Phy.out c.sys4x rst (Phy.rep8 (U.bit d.ba k))) 0 2)
     (Pads.of (fun (k : Nat) => Phy.out c.sys4x rst (Phy.rep8 (U.bit d.a k))) 0 13)
-    (Pads.of (fun (l : Nat) => Phy.out c.sys4x rst (U.ofBits (fun (b : Nat) => U.bit d.wrdm (b * 2 + l)) 8)) 0 1)
+    (Pads.of (fun (l : Nat) => Phy.out c.sys4x rst (U.ofBits (fun (b : Nat) => U.bit d.serDm (b * 2 + l)) 8)) 0 1)
     (Pads.ofIo (fun (j : Nat) => Hw.fst (V.getN 15 dqAll j)) 0 15)
     (Hw.fst (Hw.snd dqs0)) (Hw.snd (Hw.snd dqs0)) (Hw.fst (Hw.snd dqs1)) (Hw.snd (Hw.snd dqs1));
   Hw.pair (Ddr3Pads.pack pads) (PhyIn.pack (PhyIn.mk (Phy.raw (fun (j : Nat) => Hw.fst (Hw.snd (V.getN 15 dqAll j)))) rdy

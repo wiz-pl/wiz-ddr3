@@ -50,3 +50,8 @@ def Ddr3.rowBits : Nat := 14
 def Ddr3.bankBits : Nat := 3
 def Ddr3.colBits : Nat := 7
 def Ddr3.addrBits : Nat := 24
+
+-- the same with MR3 = 4: the DRAM's multipurpose register returns 0,1,0,1,… on every DQ for
+-- every read (writes are ignored), a check of the read path alone
+def Timing.artyMpr : Timing :=
+  Timing.mk 2 2 4 5 16 780 4 1 4 2 1 3 128 17 20000 50000 1312 6 0 4 2

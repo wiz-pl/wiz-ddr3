@@ -45,6 +45,7 @@ structure PortOut (r : HwTy → Type) where
   lat : r (B 5)
   map0 : r (B 256)
   map1 : r (B 256)
+  wshift : r (B 3)      -- the write shift: (wshift - 2) memory clocks
   deriving Bundle
 
 -- to the PHY, every cycle
@@ -65,6 +66,13 @@ structure Dfi (r : HwTy → Type) where
   dlyLd : r Bit         -- load the IDELAY taps
   tap0 : r (B 5)
   tap1 : r (B 5)
+  -- what the PHY serialises this cycle (the burst, shifted by the write shift found by
+  -- calibration, over the cycles from WR + wrLatency - 1 to WR + wrLatency + 1): DQ (bit
+  -- b*16 + j: sample b on DQ j), DM (bit b*2 + l), DQS, and whether to drive them
+  serDq : r (B 128)
+  serDm : r (B 16)
+  serDqs : r (B 8)
+  serOe : r Bit
   deriving Bundle
 
 -- from the PHY: the ISERDES words (bit j*8 + k: DQ j, sample k, k = 0 the earliest),
@@ -136,6 +144,8 @@ structure St (r : HwTy → Type) where
   calDone : r Bit
   calFail : r Bit
   dlyLd : r Bit
+  cw : r (B 3)          -- the write shift being tried (2: none)
+  ctry : r (B 3)        -- shifts tried
   deriving Bundle
 
 ------------------------------------------------------------------------------------
@@ -421,6 +431,28 @@ def Cal.step {r : HwTy → Type} [Hw r] (s : St r) (on : r Bit) (accept : r Bit)
     (Hw.or c7 (U.band c2 (U.isLit s.cwin 8))) c7
 
 ------------------------------------------------------------------------------------
+-- Write serialisation with a shift: a stream of 24 samples over three cycles (m = 0, 1, 2),
+-- the burst's 8 at offset 4 + 2w (w = 0 … 4: −2 … +2 memory clocks from the nominal 8).
+
+def Ser.bit {r : HwTy → Type} [Hw r] (src : Nat → r Bit) (off m b : Nat) : r Bit :=
+  match Nat.le off (8 * m + b), Nat.lt (8 * m + b) (off + 8) with
+  | .true, .true => src (8 * m + b - off)
+  | _, _ => U.lo
+def Ser.byte {r : HwTy → Type} [Hw r] (src : Nat → r Bit) (off m : Nat) : r (B 8) :=
+  U.ofBits (fun (b : Nat) => Ser.bit src off m b) 8
+def Ser.dmBit {r : HwTy → Type} [Hw r] (v : r (HwTy.prod (B 8) (B 8))) (p : Nat) : r Bit :=
+  match Nat.beq (Nat.mod p 2) 0 with
+  | .true => U.bit (Hw.fst v) (Nat.div p 2)
+  | .false => U.bit (Hw.snd v) (Nat.div p 2)
+def Ser.cycle {r : HwTy → Type} [Hw r] (src : Nat → r Bit) (h0 h1 h2 : r Bit) (w : r (B 3)) : r (B 8) :=
+  U.select w (fun (wi : Nat) =>
+    Hw.mux h0 (Ser.byte src (4 + 2 * wi) 0) (Hw.mux h1 (Ser.byte src (4 + 2 * wi) 1)
+      (Hw.mux h2 (Ser.byte src (4 + 2 * wi) 2) (Hw.lit 8 0)))) 5
+def Ser.dqs {r : HwTy → Type} [Hw r] (b : Nat) : r Bit := match Nat.beq (Nat.mod b 2) 0 with
+  | .true => U.hi
+  | .false => U.lo
+
+------------------------------------------------------------------------------------
 -- The whole step.
 
 def Ctrl.step {r : HwTy → Type} [Hw r] (t : Timing) (s : St r) (p : PortIn r) (phy : PhyIn r) : r (HwTy.prod St.code (HwTy.prod PortOut.code Dfi.code)) :=
@@ -442,7 +474,9 @@ def Ctrl.step {r : HwTy → Type} [Hw r] (t : Timing) (s : St r) (p : PortIn r) 
     (Hw.mux calOn calReq.addr portReq.addr) (Hw.mux calOn calReq.wdata portReq.wdata) (Hw.mux calOn calReq.wdm portReq.wdm);
   let sn := Sched.step t s schedOn refDue q;
   let cn := Cal.step s (U.band calOn phy.rdy) sn.accept sIdle phy.raw;
-  let ini := Init.step t s cn.finished;
+  -- a failed calibration tries the next write shift (up to five), from the start
+  let retry := U.band cn.finished (U.band cn.calFail (Hw.ult s.ctry (Hw.lit 3 4)));
+  let ini := Init.step t s (U.band cn.finished (U.bnot retry));
   let cmd := Cmd.choose schedOn sn.cmd ini.cmd;
   let rdNow := U.band (U.band s.ras (U.bnot s.cas)) s.wen;
   let wrNow := U.band (U.band s.ras (U.bnot s.cas)) (U.bnot s.wen);
@@ -455,17 +489,30 @@ def Ctrl.step {r : HwTy → Type} [Hw r] (t : Timing) (s : St r) (p : PortIn r) 
   let rvalid := U.band svc (U.getBit s.rdHist s.latR);
   let refCnt := Hw.mux schedOn (Hw.mux (U.isZero s.refCnt) (Gap.lit t.tREFI) (U.dec s.refCnt)) (Gap.lit t.tREFI);
   let wData := U.bit s.wrHist (t.wrLatency - 1);
+  let h0 := U.bit s.wrHist (t.wrLatency - 2);
+  let h2 := U.bit s.wrHist t.wrLatency;
+  let w := s.cw;
+  let serV := V.ofN 15 (fun (j : Nat) => Ser.cycle (fun (b : Nat) => U.bit s.wdata (b * 16 + j)) h0 wData h2 w);
+  let serDq := U.ofBits (fun (p : Nat) => U.bit (V.getN 15 serV (Nat.mod p 16)) (Nat.div p 16)) 128;
+  let dmV := Hw.pair (Ser.cycle (fun (b : Nat) => U.bit s.wdm (b * 2)) h0 wData h2 w)
+    (Ser.cycle (fun (b : Nat) => U.bit s.wdm (b * 2 + 1)) h0 wData h2 w);
+  let serDm := U.ofBits (fun (p : Nat) => Ser.dmBit dmV p) 16;
+  let serDqs := Ser.cycle (fun (b : Nat) => Ser.dqs b) h0 wData h2 w;
+  let serOe := U.bor h0 (U.bor wData h2);
   let dfi := Dfi.mk s.ras s.cas s.wen s.ba s.a s.cke (Hw.or (Hw.or wrNow (Hw.slice 0 1 s.wrHist)) (Hw.or (U.bit s.wrHist 1) (U.bit s.wrHist 2)))
     s.rstN s.wdata s.wdm wData
     (Hw.or (U.bit s.wrHist (t.wrLatency - 2)) (Hw.or wData (U.bit s.wrHist t.wrLatency))) wData
-    s.dlyLd (Hw.mux s.calDone s.tap0 s.ctap) (Hw.mux s.calDone s.tap1 s.ctap);
-  let out := PortOut.mk ready rvalid rdata s.calDone s.calFail s.tap0 s.tap1 s.slip0 s.slip1 s.latR s.map0 s.map1;
+    s.dlyLd (Hw.mux s.calDone s.tap0 s.ctap) (Hw.mux s.calDone s.tap1 s.ctap) serDq serDm serDqs serOe;
+  let out := PortOut.mk ready rvalid rdata s.calDone s.calFail s.tap0 s.tap1 s.slip0 s.slip1 s.latR s.map0 s.map1 s.cw;
   let st := St.mk ini.phase ini.timer ini.step ini.rstN ini.cke cmd.ras cmd.cas cmd.wen cmd.ba cmd.a
     sn.sst sn.stimer sn.swe sn.sba sn.srow sn.scol sn.wdata sn.wdm refCnt sn.refPend wrHist rdHist
     phy.raw al0 al1
-    cn.cst cn.ctap cn.cwin cn.hits0 cn.hits1 cn.lat0 cn.lat1 cn.map0 cn.map1 cn.cpos
-    cn.run0s cn.run0l cn.run1s cn.run1l cn.best0s cn.best0l cn.best0p cn.best1s cn.best1l cn.best1p
-    cn.slip0 cn.slip1 cn.tap0 cn.tap1 cn.latR cn.dly0 cn.dly1 cn.calDone cn.calFail cn.dlyLd;
+    (Hw.mux retry (Hw.lit 3 0) cn.cst) (Hw.mux retry (Hw.lit 5 0) cn.ctap) cn.cwin cn.hits0 cn.hits1 cn.lat0 cn.lat1
+    (Hw.mux retry (Hw.lit 256 0) cn.map0) (Hw.mux retry (Hw.lit 256 0) cn.map1) (Hw.mux retry (Hw.lit 8 0) cn.cpos)
+    cn.run0s cn.run0l cn.run1s cn.run1l cn.best0s (Hw.mux retry (Hw.lit 6 0) cn.best0l) cn.best0p
+    cn.best1s (Hw.mux retry (Hw.lit 6 0) cn.best1l) cn.best1p
+    cn.slip0 cn.slip1 cn.tap0 cn.tap1 cn.latR cn.dly0 cn.dly1 (Hw.mux retry U.lo cn.calDone) (Hw.mux retry U.lo cn.calFail) cn.dlyLd
+    (Hw.mux retry (Hw.mux (U.isLit s.cw 4) (Hw.lit 3 0) (U.inc s.cw)) s.cw) (Hw.mux retry (U.inc s.ctry) s.ctry);
   Hw.pair (St.pack st) (Hw.pair (PortOut.pack out) (Dfi.pack dfi))
 
 -- the initial state: everything 0 but the init timer, the command (a NOP) and the
@@ -478,7 +525,7 @@ def Ctrl.init (t : Timing) : HwTy.El St.code :=
     (Z 128) (Z 64) (Z 64)
     (Z 3) (Z 5) (Z 6) (Z 8) (Z 8) (Z 40) (Z 40) (Z 256) (Z 256) (Z 8)
     (Z 5) (Z 6) (Z 5) (Z 6) (Z 5) (Z 6) (Z 3) (Z 5) (Z 6) (Z 3)
-    (Z 3) (Z 3) (Z 5) (Z 5) (Z 5) (Z 1) (Z 1) (Z 1) (Z 1) (Z 1))
+    (Z 3) (Z 3) (Z 5) (Z 5) (Z 5) (Z 1) (Z 1) (Z 1) (Z 1) (Z 1) (BitVec.ofNat 3 2) (Z 3))
 
 def Ctrl.circuit (t : Timing) : Circuit (HwTy.prod PortIn.code PhyIn.code) (HwTy.prod PortOut.code Dfi.code) :=
   Circuit.mk St.code (Ctrl.init t) (fun s x => Ctrl.step t (St.unpack s) (PortIn.unpack (Hw.fst x)) (PhyIn.unpack (Hw.snd x)))

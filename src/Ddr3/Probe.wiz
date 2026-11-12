@@ -28,7 +28,7 @@ def Probe.step {r : HwTy → Type} [Hw r] (n : Nat) (s : PrSt r) (x : MtIn r) :
   let pat := Hw.cat (Hw.cat (Hw.slice 0 32 (Hw.cat s.cnt (Hw.lit 6 45))) (Hw.lit 32 2863311530))
     (Hw.cat (Hw.lit 32 4042322160) (Hw.slice 0 32 (Hw.cat (Hw.lit 6 51) s.cnt)));
   let dfi := Dfi.mk U.hi U.hi U.hi (Hw.lit 3 0) (Hw.lit 14 0) U.lo U.lo U.lo pat (Hw.lit 16 0) U.hi U.hi U.hi
-    U.lo (Hw.lit 5 0) (Hw.lit 5 0);
+    U.lo (Hw.lit 5 0) (Hw.lit 5 0) pat (Hw.lit 16 0) (Hw.lit 8 85) U.hi;
   let phy := Phy.io (PhyClk.mk x.sys4x x.sys4xDqs x.ref200) phyRst U.lo dfi;
   let raw := (PhyIn.unpack s.phy).raw;
   let txs := Tx.unpack s.tx;
