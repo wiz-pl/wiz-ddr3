@@ -73,6 +73,10 @@ structure MtSt (r : HwTy → Type) where
   passes : r (B 8)
   pos : r (B 9)
   tx : r Tx.code
+  rawOr : r (B 128)     -- every ISERDES bit ever seen high (a diagnostic)
+  rawAnd : r (B 128)    -- every ISERDES bit never seen low
+  dqsOr : r (B 2)       -- DQS ever seen high, and never seen low
+  dqsAnd : r (B 2)
   deriving Bundle
 
 structure MtIn (r : HwTy → Type) where
@@ -116,13 +120,7 @@ def Mt.step {r : HwTy → Type} [Hw r] (t : Timing) (ab n : Nat) (s : MtSt r) (x
   let writesEnd := U.band passEnd (U.bnot s.reading);
   let readsEnd := U.band passEnd s.reading;
   let txs := Tx.unpack s.tx;
-  let calMsg := List.append (Pr.str "DDR3 cal done=") (List.append (Pr.hex po.calDone 1)
-    (List.append (Pr.str " fail=") (List.append (Pr.hex po.calFail 1)
-    (List.append (Pr.str " tap0=") (List.append (Pr.hex po.tap0 2) (List.append (Pr.str " slip0=") (List.append (Pr.hex po.slip0 1)
-    (List.append (Pr.str " tap1=") (List.append (Pr.hex po.tap1 2) (List.append (Pr.str " slip1=") (List.append (Pr.hex po.slip1 1)
-    (List.append (Pr.str " lat=") (List.append (Pr.hex po.lat 2) (List.append Pr.crlf
-    (List.append (Pr.str "M0 ") (List.append (Pr.hex po.map0 64) (List.append Pr.crlf
-    (List.append (Pr.str "M1 ") (List.append (Pr.hex po.map1 64) Pr.crlf)))))))))))))))))));
+  let calMsg := List.append (Pr.str "DDR3 cal done=") (List.append (Pr.hex po.calDone 1) (List.append (Pr.str " fail=") (List.append (Pr.hex po.calFail 1) (List.append (Pr.str " tap0=") (List.append (Pr.hex po.tap0 2) (List.append (Pr.str " slip0=") (List.append (Pr.hex po.slip0 1) (List.append (Pr.str " tap1=") (List.append (Pr.hex po.tap1 2) (List.append (Pr.str " slip1=") (List.append (Pr.hex po.slip1 1) (List.append (Pr.str " lat=") (List.append (Pr.hex po.lat 2) (List.append (Pr.crlf) (List.append (Pr.str "M0 ") (List.append (Pr.hex po.map0 64) (List.append (Pr.crlf) (List.append (Pr.str "M1 ") (List.append (Pr.hex po.map1 64) (List.append (Pr.crlf) (List.append (Pr.str "R1 ") (List.append (Pr.hex s.rawOr 32) (List.append (Pr.crlf) (List.append (Pr.str "R0 ") (List.append (Pr.hex s.rawAnd 32) (List.append (Pr.crlf) (List.append (Pr.str "S ") (List.append (Pr.hex s.dqsOr 1) (List.append (Pr.str " ") (List.append (Pr.hex s.dqsAnd 1) (List.append (Pr.str " rst_n=") (List.append (Pr.hex cs.rstN 1) (List.append (Pr.str " cke=") (List.append (Pr.hex cs.cke 1) (List.append (Pr.str " locked=") (List.append (Pr.hex x.locked 1) (List.append (Pr.str " rstCnt=") (List.append (Pr.hex s.rstCnt 2) (Pr.crlf)))))))))))))))))))))))))))))))))))))));
   let passMsg := List.append (Pr.str "P") (List.append (Pr.hex s.pass 1) (List.append (Pr.str " err=") (List.append (Pr.hex s.errs 8)
     (List.append (Pr.str " cyc=") (List.append (Pr.hex s.cycles 8) (List.append (Pr.str " first=") (List.append (Pr.hex s.firstA 6)
     (List.append (Pr.str " got=") (List.append (Pr.hex s.firstG 8) (List.append (Pr.str " exp=") (List.append (Pr.hex s.firstE 8) Pr.crlf)))))))))));
@@ -150,12 +148,15 @@ def Mt.step {r : HwTy → Type} [Hw r] (t : Timing) (ab n : Nat) (s : MtSt r) (x
     (Hw.mux (U.band bad (U.isZero s.errs)) (Hw.slice 0 32 s.rexp) s.firstE)
     (Hw.mux readsEnd (U.inc s.passes) s.passes)
     (Hw.mux send (U.inc s.pos) (Hw.mux printed (Hw.lit 9 0) s.pos))
-    (Tx.step n txs send byte);
+    (Tx.step n txs send byte)
+    (Hw.or s.rawOr (PhyIn.unpack s.phy).raw) (Hw.and s.rawAnd (PhyIn.unpack s.phy).raw)
+    (Hw.or s.dqsOr (PhyIn.unpack s.phy).dqs) (Hw.and s.dqsAnd (PhyIn.unpack s.phy).dqs);
   Hw.pair (MtSt.pack st) (Hw.pair (Hw.fst phy)
     (Board.pack (Board.mk txs.line (Hw.cat (Hw.cat (U.bit s.passes 0) (U.bor (U.bnot (U.isZero s.errs)) U.lo)) (Hw.cat po.calFail po.calDone)))))
 
 def Mt.z (n : Nat) : HwTy.El (B n) := BitVec.ofNat n 0
 def Mt.init (t : Timing) : HwTy.El MtSt.code :=
-  Bundle.toEl MtSt.bundle (MtSt.mk (Ctrl.init t) (Mt.z 128, Mt.z 1) (Mt.z 8) (Mt.z 3) (Mt.z 2) (Mt.z 1) (Mt.z 25)
+  Bundle.toEl MtSt.bundle (MtSt.mk (Ctrl.init t) (Mt.z 128, (Mt.z 1, Mt.z 2)) (Mt.z 8) (Mt.z 3) (Mt.z 2) (Mt.z 1) (Mt.z 25)
     (Mt.z 1) (Mt.z 24) (Mt.z 128) (BitVec.ofNat 32 Mt.seed) (Mt.z 32) (Mt.z 32) (Mt.z 24) (Mt.z 32) (Mt.z 32)
-    (Mt.z 8) (Mt.z 9) (Bundle.toEl Tx.bundle (Tx.mk (BitVec.ofNat 1 1) (Mt.z 4) (Mt.z 10) (BitVec.ofNat 9 511))))
+    (Mt.z 8) (Mt.z 9) (Bundle.toEl Tx.bundle (Tx.mk (BitVec.ofNat 1 1) (Mt.z 4) (Mt.z 10) (BitVec.ofNat 9 511)))
+    (Mt.z 128) (BitVec.ofNat 128 (Nat.pow 2 128 - 1)) (Mt.z 2) (BitVec.ofNat 2 3))

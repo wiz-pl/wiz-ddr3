@@ -63,7 +63,7 @@ def CTb.step {r : HwTy → Type} [Hw r] (t : Timing) (mp : MParams) (s : CTbSt r
   Hw.pair (CTbSt.pack st) (CTbOut.pack (CTbOut.mk cs.calDone v.err v.ecode g.ops g.bad cst.hits cst.misses v.writes v.reads))
 
 def CTb.init (t : Timing) : HwTy.El CTbSt.code :=
-  Bundle.toEl CTbSt.bundle (CTbSt.mk C.init (Ctrl.init t) Model.init (BitVec.ofNat 128 0, BitVec.ofNat 1 0)
+  Bundle.toEl CTbSt.bundle (CTbSt.mk C.init (Ctrl.init t) Model.init (BitVec.ofNat 128 0, (BitVec.ofNat 1 0, BitVec.ofNat 2 0))
     (Bundle.toEl CGen.bundle (CGen.mk (BitVec.ofNat 32 2463534242) (fun (a : BitVec 6) => BitVec.ofNat 32 0)
       (BitVec.ofNat 16 0) (BitVec.ofNat 16 0))))
 def CTb.circuit (t : Timing) (mp : MParams) : Circuit Bit CTbOut.code :=

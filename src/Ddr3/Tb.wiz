@@ -101,7 +101,7 @@ def Tb.gen0 : HwTy.El Gen.code :=
     (BitVec.ofNat 32 0) (BitVec.ofNat 32 0) (BitVec.ofNat 6 0) (BitVec.ofNat 32 0) (BitVec.ofNat 6 0)
     (BitVec.ofNat 128 0) (BitVec.ofNat 128 0))
 def Tb.init (t : Timing) : HwTy.El TbSt.code :=
-  Bundle.toEl TbSt.bundle (TbSt.mk (Ctrl.init t) Model.init (BitVec.ofNat 128 0, BitVec.ofNat 1 0) Tb.gen0)
+  Bundle.toEl TbSt.bundle (TbSt.mk (Ctrl.init t) Model.init (BitVec.ofNat 128 0, (BitVec.ofNat 1 0, BitVec.ofNat 2 0)) Tb.gen0)
 
 -- no inputs: the generator drives everything
 def Tb.circuit (t : Timing) (mp : MParams) : Circuit Bit TbOut.code :=

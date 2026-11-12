@@ -236,7 +236,7 @@ def Model.step {r : HwTy → Type} [Hw r] (t : Timing) (mp : MParams) (s : MSt r
     addr isWr s.wa1 s.wv1 d.dqsOe
     pipe (Hw.fst outNext) (Hw.snd outNext) s.outV s.outD
     (Hw.mux d.dlyLd d.tap0 s.tap0) (Hw.mux d.dlyLd d.tap1 s.tap1);
-  Hw.pair (MSt.pack st) (Hw.pair (PhyIn.pack (PhyIn.mk (Model.raw mp s) U.hi))
+  Hw.pair (MSt.pack st) (Hw.pair (PhyIn.pack (PhyIn.mk (Model.raw mp s) U.hi (Hw.lit 2 0)))
     (Viol.pack (Viol.mk s.err s.ecode s.at s.refs s.writes s.reads)))
 
 def Model.bank0 : HwTy.El Bank.code :=

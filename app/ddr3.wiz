@@ -1,4 +1,5 @@
 import Ddr3.Board
+import Ddr3.Probe
 import Ddr3.Tb
 import Ddr3.CacheTb
 import Hdl.Arty
@@ -113,6 +114,7 @@ def mpOf : List String → MParams
 -- gen, bit
 
 def design : Netlist := Circuit.netlist "memtest" (Board.memtestC Timing.arty 24 866)
+def probeNet : Netlist := Circuit.netlist "probe" (Probe.circuit 866)
 
 -- primitive instances by module name
 def bump (k : String) : List (String × Nat) → List (String × Nat)
@@ -211,6 +213,39 @@ def pnr (dirs : Dirs) (d : Arty.Device) (name : String) : EIO Unit := do
     (.cons "--part_name" (.cons part (.cons "--frm_file" (.cons (dev d (name <+> ".frames"))
     (.cons "--output_file" (.cons (dev d (name <+> ".bit")) .nil))))))))
 
+def pnrX (dirs : Dirs) (d : Arty.Device) (name xdc : String) : EIO Unit := do
+  let part := Arty.Device.xrayPart d;
+  tool "nextpnr-xilinx" (.cons "--chipdb" (.cons (dirs.chipdb <+> "/" <+> Arty.Device.chipdb d <+> ".bin")
+    (.cons "--xdc" (.cons (build xdc) (.cons "--json" (.cons (build (name <+> ".json"))
+    (.cons "--fasm" (.cons (dev d (name <+> ".fasm")) (.cons "--log" (.cons (dev d (name <+> ".nextpnr.log"))
+    (.cons "-q" .nil)))))))))));
+  lg ← FS.readFile (dev d (name <+> ".nextpnr.log"));
+  say (name <+> " on " <+> Arty.Device.part d <+> ": timing (nextpnr)");
+  -- (nextpnr reports after placement and twice after routing: the last one counts)
+  sayAll (lastOf (keep timingLine (lines lg)));
+  fr ← toolOutput "fasm2frames" (.cons "--part" (.cons part (.cons "--db-root" (.cons (dirs.db <+> "/artix7")
+    (.cons (dev d (name <+> ".fasm")) .nil)))));
+  FS.writeFile (dev d (name <+> ".frames")) fr;
+  tool "xc7frames2bit" (.cons "--part_file" (.cons (dirs.db <+> "/artix7/" <+> part <+> "/part.yaml")
+    (.cons "--part_name" (.cons part (.cons "--frm_file" (.cons (dev d (name <+> ".frames"))
+    (.cons "--output_file" (.cons (dev d (name <+> ".bit")) .nil))))))))
+
+def probe2 (dirs : Dirs) : EIO Unit := do
+  ensureDir "build";
+  FS.writeFile (build "probe2.v") (Verilog.emitTop (Circuit.netlist "probe2" (Probe2.circuit 866)) Board.clocking);
+  FS.writeFile (build "probe2.xdc") Probe2.xdc;
+  synth "probe2";
+  ensureDir (build "a35t");
+  pnrX dirs Arty.Device.default "probe2" "probe2.xdc"
+
+def probe (dirs : Dirs) : EIO Unit := do
+  ensureDir "build";
+  FS.writeFile (build "probe.v") (Verilog.emitTop probeNet Board.clocking);
+  FS.writeFile (build "probe.xdc") Board.xdc;
+  synth "probe";
+  ensureDir (build "a35t");
+  pnrX dirs Arty.Device.default "probe" "probe.xdc"
+
 def bit (dirs : Dirs) : EIO Unit := do
   gen;
   synth "memtest";
@@ -301,6 +336,10 @@ def runArgs (a : Args) : EIO Unit := match a.words with
     | _, _, .true => EIO.bind (dirsOf a) bit
     | _, _, _ => (match String.eq cmd "vsim" with
       | .true => vsim
+      | .false => match String.eq cmd "probe" with
+      | .true => EIO.bind (dirsOf a) probe
+      | .false => match String.eq cmd "probe2" with
+      | .true => EIO.bind (dirsOf a) probe2
       | .false => match String.eq cmd "csim", rest with
         | .true, .cons w ps => csimRun (natOf w) (mpOf ps)
         | .true, .nil => csimRun 4000 MParams.default

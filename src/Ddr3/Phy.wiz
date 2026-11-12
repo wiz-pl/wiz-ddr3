@@ -62,9 +62,9 @@ def Phy.cmd8 {r : HwTy → Type} [Hw r] (b : r Bit) : r (B 8) := Hw.cat (Hw.cat 
 def Phy.out {r : HwTy → Type} [Hw r] (fast : r HwTy.clock) (rst : r Bit) (d : r (B 8)) : r (HwTy.pad 1) :=
   X7.obuf (Hw.fst (Phy.ser fast rst d U.lo))
 
--- DQ j: written from the burst, read back through the IDELAY of its lane: its pad and
--- its raw word
-def Phy.dq {r : HwTy → Type} [Hw r] (c : PhyClk r) (rst : r Bit) (d : Dfi r) (j : Nat) : r (HwTy.prod (HwTy.inout 1) (B 8)) :=
+-- DQ j: written from the burst, read back through the IDELAY of its lane: its pad, its
+-- raw word, and its input buffer's output itself (a diagnostic)
+def Phy.dq {r : HwTy → Type} [Hw r] (c : PhyClk r) (rst : r Bit) (d : Dfi r) (j : Nat) : r (HwTy.prod (HwTy.inout 1) (HwTy.prod (B 8) Bit)) :=
   let ser := Phy.ser c.sys4x rst (U.ofBits (fun (b : Nat) => U.bit d.wrdata (b * 16 + j)) 8) (U.bnot d.dqOe);
   let io := X7.iobufT (Hw.fst ser) (Hw.snd ser);
   let tap := match Nat.lt j 8 with
@@ -72,7 +72,7 @@ def Phy.dq {r : HwTy → Type} [Hw r] (c : PhyClk r) (rst : r Bit) (d : Dfi r) (
     | .false => d.tap1;
   let dly := X7.idelay U.lo U.lo d.dlyLd tap (Hw.fst io);
   let q := X7.iserdes c.sys4x Hw.clock rst (Hw.fst dly);
-  Hw.pair (Hw.snd io) (U.ofBits (fun (k : Nat) => U.bit q (7 - k)) 8)
+  Hw.pair (Hw.snd io) (Hw.pair (U.ofBits (fun (k : Nat) => U.bit q (7 - k)) 8) (Hw.fst io))
 
 -- the raw words of all DQs, from their pieces
 def Phy.raw {r : HwTy → Type} [Hw r] (qs : Nat → r (B 8)) : r (B 128) :=
@@ -100,4 +100,5 @@ def Phy.io {r : HwTy → Type} [Hw r] (c : PhyClk r) (rst : r Bit) (rstN : r Bit
     (Pads.of (fun (l : Nat) => Phy.out c.sys4x rst (U.ofBits (fun (b : Nat) => U.bit d.wrdm (b * 2 + l)) 8)) 0 1)
     (Pads.ofIo (fun (j : Nat) => Hw.fst (V.getN 15 dqAll j)) 0 15)
     (Hw.fst (Hw.snd dqs0)) (Hw.snd (Hw.snd dqs0)) (Hw.fst (Hw.snd dqs1)) (Hw.snd (Hw.snd dqs1));
-  Hw.pair (Ddr3Pads.pack pads) (PhyIn.pack (PhyIn.mk (Phy.raw (fun (j : Nat) => Hw.snd (V.getN 15 dqAll j))) rdy))
+  Hw.pair (Ddr3Pads.pack pads) (PhyIn.pack (PhyIn.mk (Phy.raw (fun (j : Nat) => Hw.fst (Hw.snd (V.getN 15 dqAll j)))) rdy
+    (Hw.cat (Hw.fst dqs1) (Hw.fst dqs0))))

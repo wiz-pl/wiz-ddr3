@@ -72,6 +72,7 @@ structure Dfi (r : HwTy → Type) where
 structure PhyIn (r : HwTy → Type) where
   raw : r (B 128)
   rdy : r Bit
+  dqs : r (B 2)         -- DQS1's and DQS0's input buffers, sampled (a diagnostic)
   deriving Bundle
 
 structure St (r : HwTy → Type) where

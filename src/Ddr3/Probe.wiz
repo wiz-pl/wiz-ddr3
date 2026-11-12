@@ -1,0 +1,132 @@
+import Ddr3.Board
+-- A board probe of the PHY alone: the DRAM is held in reset (RESET# low, CKE low), so it
+-- leaves the bus alone, and the FPGA drives DQ itself through the OSERDESE2s with a
+-- known pattern while reading the pads back through IDELAYE2 and ISERDESE2. Every half
+-- second it prints which ISERDES bits were seen high and low, and one raw word:
+--   R1 <32 hex> R0 <32 hex> W <32 hex>
+-- and the input buffers of DQS1 (bit 1) and DQS0 (bit 0), sampled straight into fabric
+-- flip-flops: IB1 ever high, IB0 never low.
+-- With the input path working, R1 has every bit set, R0 none, and W shows the pattern.
+
+structure PrSt (r : HwTy → Type) where
+  phy : r PhyIn.code
+  rstCnt : r (B 8)
+  cnt : r (B 26)
+  rawOr : r (B 128)
+  rawAnd : r (B 128)
+  snap : r (B 128)
+  dqOr : r (B 2)
+  dqAnd : r (B 2)
+  pos : r (B 9)
+  tx : r Tx.code
+  deriving Bundle
+
+def Probe.step {r : HwTy → Type} [Hw r] (n : Nat) (s : PrSt r) (x : MtIn r) :
+    r (HwTy.prod PrSt.code (HwTy.prod Ddr3Pads.code Board.code)) :=
+  let phyRst := U.bnot (U.isLit s.rstCnt 255);
+  -- the pattern: beat b on DQ j is bit (b + j + cnt) of 0b10110010 (changes every cycle)
+  let pat := Hw.cat (Hw.cat (Hw.slice 0 32 (Hw.cat s.cnt (Hw.lit 6 45))) (Hw.lit 32 2863311530))
+    (Hw.cat (Hw.lit 32 4042322160) (Hw.slice 0 32 (Hw.cat (Hw.lit 6 51) s.cnt)));
+  let dfi := Dfi.mk U.hi U.hi U.hi (Hw.lit 3 0) (Hw.lit 14 0) U.lo U.lo U.lo pat (Hw.lit 16 0) U.hi U.hi U.hi
+    U.lo (Hw.lit 5 0) (Hw.lit 5 0);
+  let phy := Phy.io (PhyClk.mk x.sys4x x.sys4xDqs x.ref200) phyRst U.lo dfi;
+  let raw := (PhyIn.unpack s.phy).raw;
+  let txs := Tx.unpack s.tx;
+  let msg := List.append (Pr.str "R1 ") (List.append (Pr.hex s.rawOr 32) (List.append (Pr.str " R0 ") (List.append (Pr.hex s.rawAnd 32) (List.append (Pr.str " W ") (List.append (Pr.hex s.snap 32) (List.append (Pr.str " rdy=") (List.append (Pr.hex (PhyIn.unpack s.phy).rdy 1) (List.append (Pr.str " IB1 ") (List.append (Pr.hex s.dqOr 1) (List.append (Pr.str " IB0 ") (List.append (Pr.hex s.dqAnd 1) (Pr.crlf))))))))))));
+  let tick := U.isZero s.cnt;
+  let printing := U.bnot (U.isZero s.pos);
+  let more := Hw.ult s.pos (Hw.lit 9 (List.length msg + 1));
+  let send := U.band printing (U.band more (Tx.idle txs));
+  let byte := Pr.byteAt msg (U.dec s.pos);
+  let st := PrSt.mk (Hw.snd phy) (Hw.mux phyRst (Hw.mux x.locked (U.inc s.rstCnt) s.rstCnt) s.rstCnt) (U.inc s.cnt)
+    (Hw.mux tick (Hw.lit 128 0) (Hw.or s.rawOr raw)) (Hw.mux tick (Hw.lit 128 (Nat.pow 2 128 - 1)) (Hw.and s.rawAnd raw))
+    (Hw.mux (U.isLit s.cnt 1000) raw s.snap)
+    (Hw.mux tick (Hw.lit 2 0) (Hw.or s.dqOr (PhyIn.unpack s.phy).dqs)) (Hw.mux tick (Hw.lit 2 3) (Hw.and s.dqAnd (PhyIn.unpack s.phy).dqs))
+    (Hw.mux tick (Hw.lit 9 1) (Hw.mux send (U.inc s.pos) (Hw.mux (U.band printing (U.bnot more)) (Hw.lit 9 0) s.pos)))
+    (Tx.step n txs send byte);
+  Hw.pair (PrSt.pack st) (Hw.pair (Hw.fst phy) (Board.pack (Board.mk txs.line (Hw.cat (Hw.lit 3 0) (U.bit s.cnt 25)))))
+
+def Probe.init : HwTy.El PrSt.code :=
+  Bundle.toEl PrSt.bundle (PrSt.mk (Mt.z 128, (Mt.z 1, Mt.z 2)) (Mt.z 8) (BitVec.ofNat 26 1) (Mt.z 128) (Mt.z 128) (Mt.z 128)
+    (Mt.z 2) (BitVec.ofNat 2 3) (Mt.z 9) (Bundle.toEl Tx.bundle (Tx.mk (BitVec.ofNat 1 1) (Mt.z 4) (Mt.z 10) (BitVec.ofNat 9 511))))
+def Probe.circuit (n : Nat) : Circuit MtIn.code (HwTy.prod Ddr3Pads.code Board.code) :=
+  Circuit.mk PrSt.code Probe.init (fun s x => Probe.step n (PrSt.unpack s) (MtIn.unpack x))
+
+------------------------------------------------------------------------------------
+-- Probe 2, outside the DDR bank (bank 35/16, LVCMOS33): LD4 (led_0) is driven by an
+-- OSERDESE2 that sends 0xFF or 0x00 by a slow counter bit (LD4 blinks at 0.75 Hz if the
+-- OSERDES works); the UART's RX pin (idle high) is read through IBUF, IDELAYE2 and
+-- ISERDESE2, and the ISERDES bits seen high and low are printed as in the first probe.
+
+structure P2In (r : HwTy → Type) where
+  sys4x : r HwTy.clock
+  sys4xDqs : r HwTy.clock
+  ref200 : r HwTy.clock
+  locked : r Bit
+  uart_rx : r (HwTy.pad 1)
+  deriving Bundle
+structure P2Out (r : HwTy → Type) where
+  uart_tx : r Bit
+  led_0 : r (HwTy.pad 1)
+  led_1 : r Bit
+  led_2 : r (HwTy.pad 1)
+  rgb_0 : r (HwTy.inout 1)
+  deriving Bundle
+
+structure P2St (r : HwTy → Type) where
+  rstCnt : r (B 8)
+  cnt : r (B 26)
+  q : r (B 8)
+  qOr : r (B 8)
+  qAnd : r (B 8)
+  g : r (B 8)
+  gOr : r (B 8)
+  gAnd : r (B 8)
+  gSnap : r (B 8)
+  pos : r (B 9)
+  tx : r Tx.code
+  deriving Bundle
+
+def Probe2.step {r : HwTy → Type} [Hw r] (n : Nat) (s : P2St r) (x : P2In r) : r (HwTy.prod P2St.code P2Out.code) :=
+  let rst := U.bnot (U.isLit s.rstCnt 255);
+  let ser := X7.oserdes x.sys4x Hw.clock rst (Phy.rep8 (U.bit s.cnt 25)) U.lo;
+  let led := X7.obuf (Hw.fst ser);
+  -- the same on LD6 (T9), a left-side pin (LIOI3)
+  let ser2 := X7.oserdes x.sys4x Hw.clock rst (Phy.rep8 (U.bit s.cnt 25)) U.lo;
+  let led2 := X7.obuf (Hw.fst ser2);
+  let rx := X7.ibuf x.uart_rx;
+  let dly := X7.idelay U.lo U.lo U.lo (Hw.lit 5 0) rx;
+  let q := X7.iserdes x.sys4x Hw.clock rst (Hw.fst dly);
+  let rdy := X7.idelayctrl x.ref200 rst;
+  -- a right-side LVCMOS33 pin (RGB LED LD0 red, G6) driven with 0xF0 through an OSERDES and
+  -- read back through IDELAY and ISERDES, as a DQ is
+  let gser := X7.oserdes x.sys4x Hw.clock rst (Hw.lit 8 240) U.lo;
+  let gio := X7.iobufT (Hw.fst gser) (Hw.snd gser);
+  let gdly := X7.idelay U.lo U.lo U.lo (Hw.lit 5 0) (Hw.fst gio);
+  let gq := X7.iserdes x.sys4x Hw.clock rst (Hw.fst gdly);
+  let txs := Tx.unpack s.tx;
+  let msg := List.append (Pr.str "Q1 ") (List.append (Pr.hex s.qOr 2) (List.append (Pr.str " Q0 ")
+    (List.append (Pr.hex s.qAnd 2) (List.append (Pr.str " rdy=") (List.append (Pr.hex rdy 1) (List.append (Pr.str " G1 ") (List.append (Pr.hex s.gOr 2)
+    (List.append (Pr.str " G0 ") (List.append (Pr.hex s.gAnd 2) (List.append (Pr.str " GW ") (List.append (Pr.hex s.gSnap 2) Pr.crlf)))))))))));
+  let tick := U.isZero s.cnt;
+  let printing := U.bnot (U.isZero s.pos);
+  let more := Hw.ult s.pos (Hw.lit 9 (List.length msg + 1));
+  let send := U.band printing (U.band more (Tx.idle txs));
+  let byte := Pr.byteAt msg (U.dec s.pos);
+  let st := P2St.mk (Hw.mux rst (Hw.mux x.locked (U.inc s.rstCnt) s.rstCnt) s.rstCnt) (U.inc s.cnt) q
+    (Hw.mux tick (Hw.lit 8 0) (Hw.or s.qOr s.q)) (Hw.mux tick (Hw.lit 8 255) (Hw.and s.qAnd s.q))
+    gq (Hw.mux tick (Hw.lit 8 0) (Hw.or s.gOr s.g)) (Hw.mux tick (Hw.lit 8 255) (Hw.and s.gAnd s.g))
+    (Hw.mux (U.isLit s.cnt 1000) s.g s.gSnap)
+    (Hw.mux tick (Hw.lit 9 1) (Hw.mux send (U.inc s.pos) (Hw.mux (U.band printing (U.bnot more)) (Hw.lit 9 0) s.pos)))
+    (Tx.step n txs send byte);
+  Hw.pair (P2St.pack st) (P2Out.pack (P2Out.mk txs.line led (U.bit s.cnt 25) led2 (Hw.snd gio)))
+
+def Probe2.init : HwTy.El P2St.code :=
+  Bundle.toEl P2St.bundle (P2St.mk (Mt.z 8) (BitVec.ofNat 26 1) (Mt.z 8) (Mt.z 8) (Mt.z 8) (Mt.z 8) (Mt.z 8) (Mt.z 8) (Mt.z 8) (Mt.z 9)
+    (Bundle.toEl Tx.bundle (Tx.mk (BitVec.ofNat 1 1) (Mt.z 4) (Mt.z 10) (BitVec.ofNat 9 511))))
+def Probe2.circuit (n : Nat) : Circuit P2In.code P2Out.code :=
+  Circuit.mk P2St.code Probe2.init (fun s x => Probe2.step n (P2St.unpack s) (P2In.unpack x))
+def Probe2.xdc : String :=
+  Hdl.concat (Hdl.map Xdc.pinLine (.cons (Bd.lv "clk" "E3") (.cons (Bd.lv "uart_rx" "A9") (.cons (Bd.lv "uart_tx" "D10")
+    (.cons (Bd.lv "led_0" "H5") (.cons (Bd.lv "led_1" "J5") (.cons (Bd.lv "led_2" "T9") (.cons (Bd.lv "rgb_0" "G6") .nil))))))))
+  <+> "create_clock -period 10.000 [get_ports {clk}]\n"

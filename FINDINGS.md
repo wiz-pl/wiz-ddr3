@@ -89,3 +89,22 @@ Recorded as the work goes (agent ddr3, from 2026-11-12). Design notes:
 * D3b (proofs/SchedProof.wiz): the machine, monitor, BFS and soundness lemmas are
   written; the kernel check has not run yet (it was queued for heavy when work stopped). D3c (`ddr3 vsim`, Icarus
   + Micron + unisims) is written but has not been run.
+
+## On the board (2026-11-12, afternoon): the SERDES paths
+
+* The memtest (130 MHz timing) runs: UART, passes every 2.74 s (2 × 256 MB). But every read
+  returns 0 and calibration finds nothing.
+* Diagnostics: the PLL is locked and the SERDES reset is released; internal rst_n=1 and
+  cke=1. No ISERDES bit is ever 1, not even while the FPGA itself drives DQ (DRAM held in
+  reset). Adding IDELMUXE3.P0/P1 (openXC7/nextpnr-xilinx#165) changes nothing.
+* Split probe:
+  - left side (LIOI3, uart_rx, LVCMOS33) IBUF→IDELAYE2→ISERDESE2: works (reads the idle
+    line as all ones);
+  - right side (RIOI3, G6, LVCMOS33) OSERDES→IOBUF→IDELAY→ISERDES: reads nothing;
+  - LD4 (H5, right side) driven by an OSERDESE2: dark, while LD5 driven from fabric
+    blinks.
+  The OSERDESE2 doesn't drive its pad. The segbits are identical left and right, and the
+  routing to the right side's leaf clocks is present in the FASM. Still open.
+* A fabric tap on an input that also feeds an IDELAYE2 can't be built: nextpnr routes it
+  through the IDELAY as FIXED, and fasm2frames rejects it (FasmInconsistentBits: TYPE_FIXED
+  against TYPE_VAR_LOAD).
