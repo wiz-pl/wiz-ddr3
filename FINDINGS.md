@@ -145,3 +145,22 @@ Diagnostics that found them (still in the memtest): R1/R0 (ISERDES bits ever hig
 the D0..DF dump (16 cycles of DQS+DQ samples from a write and from its read-back), and an
 MPR build (Timing.artyMpr) that proved the read path on its own. The calibration also
 sweeps a write shift in half memory clocks (9 tries) and prints the one it kept (`w=`).
+
+### The memtest on the board (f99ab70 + 4a378d4)
+
+    DDR3 cal done=1 fail=0 tap0=14 slip0=3 tap1=14 slip1=3 lat=07 w=4
+    M0 000000000000000000000000E000000007FFE000000007FF0000000000000000
+    M1 000000000000000000000000E000000007FFC000000007FF0000000000000000
+    P0 err=00000002 cyc=15635577 …   (first pass only: bursts the dump/calibration had touched)
+    P1 err=00000000 cyc=1563559A
+    P2 err=00000000 cyc=15635589
+    P0 err=00000000 …   P1 err=00000000 …
+
+* Calibration keeps the nominal write shift (w=4) and IDELAY tap 0x14 = 20 (of 32) on both
+  lanes, with bit slip 3 and read latency 7. The good windows are about 14 taps (~1.1 ns)
+  wide.
+* All 256 MB, every pass (walking ones, address in address, random): 0 errors after the
+  first pass. The first pass's 2 errors are at burst 0, which still held the calibration
+  pattern when it was read back. Probably the first write after the dump; not chased.
+* Bandwidth: 0x1563559A = 358.8 M cycles at 100 MHz = 3.59 s to write and read 2 × 256 MB,
+  i.e. about 150 MB/s for the closed-page controller (one access at a time).
