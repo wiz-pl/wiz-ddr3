@@ -58,3 +58,15 @@ Recorded as the work goes (agent ddr3, from 2026-11-12). Design notes:
   rising edge 0.25 tCK before CK's, which is the edge of JEDEC's tDQSS window
   (+-0.25 tCK). It works on this board under Vivado; there is no ODELAY in HR banks to
   move it.
+
+## Wiz kernel/elaborator bug: auto-share picks an ill-kinded ShareLet instance (PANIC)
+
+* `let b := base` where `base : St HwTy.El` (any bundle at values), with Hdl.Core
+  imported, makes `wiz check` PANIC ("vApp: ill-typed application", Wiz.Core.Eval:455).
+  Auto-share turns the `let` into `ShareLet.share`, and instance search accepts
+  `ShareLet (r a) (r b)` with r := St, a := HwTy.El. That is ill-kinded, and nothing checks
+  it. Minimal repro (Prelude only): /workspace/wiz-notes/bugs/autoshare-illkinded-panic.wiz.
+  Reported to main.
+* Workaround: `let ω b := …`, or no `let` (proofs/SchedProof.wiz projects `(SP.base).f`).
+* Also: `SP.base.phase` (a field of a namespaced constant, written with dots) is "unknown
+  identifier 'SP'"; `(SP.base).phase` works.
