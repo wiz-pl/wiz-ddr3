@@ -1,0 +1,95 @@
+import Ddr3.Ctrl
+-- A direct-mapped write-back cache in front of the controller's native port, with the
+-- 32-bit port wiz-rv uses (agreed with it): valid, addr[27:0] (a byte offset into the
+-- 256 MB), we, wdata[31:0], wstrb[3:0], answered by ready (and rdata[31:0] with rvalid
+-- for a read, in the same cycle); one request at a time, held until ready.
+--
+-- 8 KB: 512 lines of 16 bytes, a line one DDR3 burst. A byte address is tag (15 bits,
+-- 27..13) · index (9, 12..4) · word (2, 3..2) · byte (2). The data and the tags (tag,
+-- valid, dirty) are block RAMs with a registered read. A request: one cycle to read the
+-- line and its tag, one to compare; a hit answers then (a write merges its bytes and marks
+-- the line dirty); a miss writes the old line back if it is dirty, reads the new one, and
+-- compares again.
+
+structure CReq (r : HwTy → Type) where
+  valid : r Bit
+  addr : r (B 28)
+  we : r Bit
+  wdata : r (B 32)
+  wstrb : r (B 4)
+  deriving Bundle
+structure CResp (r : HwTy → Type) where
+  ready : r Bit
+  rvalid : r Bit
+  rdata : r (B 32)
+  deriving Bundle
+
+structure CSt (r : HwTy → Type) where
+  data : r (HwTy.mem 9 128)
+  tags : r (HwTy.mem 9 17)    -- bit 16 valid, bit 15 dirty, 14..0 the tag
+  st : r (B 3)                -- 0 idle, 1 compare, 2 write back, 3 read the line, 4 wait for it
+  addr : r (B 28)
+  we : r Bit
+  wdata : r (B 32)
+  wstrb : r (B 4)
+  line : r (B 128)
+  tagw : r (B 17)
+  hits : r (B 32)
+  misses : r (B 32)
+  deriving Bundle
+
+def C.idx {r : HwTy → Type} [Hw r] (a : r (B 28)) : r (B 9) := Hw.slice 4 9 a
+def C.tag {r : HwTy → Type} [Hw r] (a : r (B 28)) : r (B 15) := Hw.slice 13 15 a
+-- word `w` of a line, and the line with bytes of word `w` replaced where `strb` says
+def C.word {r : HwTy → Type} [Hw r] (line : r (B 128)) (w : r (B 2)) : r (B 32) :=
+  U.select w (fun (k : Nat) => Hw.slice (k * 32) 32 line) 4
+def C.merge {r : HwTy → Type} [Hw r] (line : r (B 128)) (w : r (B 2)) (d : r (B 32)) (strb : r (B 4)) : r (B 128) :=
+  U.ofBits (fun (p : Nat) =>
+    let ω k := Nat.div p 32;
+    let ω byte := Nat.div (Nat.mod p 32) 8;
+    Hw.mux (U.band (U.isLit w k) (U.bit strb byte)) (U.bit d (Nat.mod p 32)) (U.bit line p)) 128
+
+-- the step: the core's request and the controller's response in; the cache's next
+-- state, its answer to the core and its request to the controller out
+def C.step {r : HwTy → Type} [Hw r] (s : CSt r) (q : CReq r) (ddr : PortOut r) :
+    r (HwTy.prod CSt.code (HwTy.prod CResp.code PortIn.code)) :=
+  let idle := U.isLit s.st 0;
+  let cmp := U.isLit s.st 1;
+  let wb := U.isLit s.st 2;
+  let fill := U.isLit s.st 3;
+  let wait := U.isLit s.st 4;
+  let start := U.band idle q.valid;
+  let idx := C.idx s.addr;
+  let tg := C.tag s.addr;
+  let valid := U.bit s.tagw 16;
+  let dirty := U.bit s.tagw 15;
+  let hit := U.band valid (Hw.eq (Hw.slice 0 15 s.tagw) tg);
+  let hitNow := U.band cmp hit;
+  let missNow := U.band cmp (U.bnot hit);
+  let wHit := U.band hitNow s.we;
+  let w := Hw.slice 2 2 s.addr;
+  let merged := C.merge s.line w s.wdata s.wstrb;
+  -- the controller's request: write the victim back, or read the line
+  let dreq := PortIn.mk (U.bor wb fill) wb
+    (Hw.mux wb (Hw.cat (Hw.slice 0 15 s.tagw) idx) (Hw.cat tg idx)) s.line (Hw.lit 16 65535);
+  let acc := U.band dreq.valid ddr.ready;
+  let got := U.band wait ddr.rvalid;
+  let newTag := Hw.cat (Hw.cat U.hi U.lo) tg;
+  let data := Hw.memWrite (Hw.memWrite s.data wHit idx merged) got idx ddr.rdata;
+  let tags := Hw.memWrite (Hw.memWrite s.tags wHit (C.idx s.addr) (Hw.cat (Hw.cat U.hi U.hi) tg)) got idx newTag;
+  let qIdx := C.idx q.addr;
+  let st := Hw.mux start (Hw.lit 3 1) (Hw.mux hitNow (Hw.lit 3 0)
+    (Hw.mux missNow (Hw.mux (U.band valid dirty) (Hw.lit 3 2) (Hw.lit 3 3))
+    (Hw.mux (U.band wb acc) (Hw.lit 3 3) (Hw.mux (U.band fill acc) (Hw.lit 3 4) (Hw.mux got (Hw.lit 3 1) s.st)))));
+  let ns := CSt.mk data tags st (Hw.mux start q.addr s.addr) (Hw.mux start q.we s.we) (Hw.mux start q.wdata s.wdata)
+    (Hw.mux start q.wstrb s.wstrb)
+    (Hw.mux start (Hw.memRead s.data qIdx) (Hw.mux got ddr.rdata s.line))
+    (Hw.mux start (Hw.memRead s.tags qIdx) (Hw.mux got newTag s.tagw))
+    (Hw.mux hitNow (U.inc s.hits) s.hits) (Hw.mux missNow (U.inc s.misses) s.misses);
+  Hw.pair (CSt.pack ns) (Hw.pair (CResp.pack (CResp.mk hitNow (U.band hitNow (U.bnot s.we)) (C.word s.line w)))
+    (PortIn.pack dreq))
+
+def C.init : HwTy.El CSt.code :=
+  Bundle.toEl CSt.bundle (CSt.mk (fun (a : BitVec 9) => BitVec.ofNat 128 0) (fun (a : BitVec 9) => BitVec.ofNat 17 0)
+    (BitVec.ofNat 3 0) (BitVec.ofNat 28 0) (BitVec.ofNat 1 0) (BitVec.ofNat 32 0) (BitVec.ofNat 4 0) (BitVec.ofNat 128 0)
+    (BitVec.ofNat 17 0) (BitVec.ofNat 32 0) (BitVec.ofNat 32 0))

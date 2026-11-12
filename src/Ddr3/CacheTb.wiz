@@ -1,0 +1,71 @@
+import Ddr3.Cache
+import Ddr3.Tb
+-- The cache, the controller and the behavioural device, in lockstep with a word-level
+-- reference memory: a generator issues 32-bit reads and writes (random byte strobes) to
+-- 64 words that fall on 4 cache lines × 4 tags, so lines are evicted and written back.
+
+structure CGen (r : HwTy → Type) where
+  lfsr : r (B 32)
+  ref : r (HwTy.mem 6 32)
+  ops : r (B 16)
+  bad : r (B 16)
+  deriving Bundle
+
+structure CTbSt (r : HwTy → Type) where
+  cache : r CSt.code
+  ctrl : r St.code
+  model : r MSt.code
+  phy : r PhyIn.code
+  gen : r CGen.code
+  deriving Bundle
+
+structure CTbOut (r : HwTy → Type) where
+  calDone : r Bit
+  err : r Bit
+  ecode : r B8
+  ops : r (B 16)
+  bad : r (B 16)
+  hits : r (B 32)
+  misses : r (B 32)
+  writes : r (B 16)
+  reads : r (B 16)
+  deriving Bundle
+
+-- word i: tag {i5, i4}, line {i3, i2}, word {i1, i0}
+def CG.addr {r : HwTy → Type} [Hw r] (i : r (B 6)) : r (B 28) :=
+  Hw.cat (Hw.cat (Hw.lit 13 0) (Hw.slice 4 2 i)) (Hw.cat (Hw.cat (Hw.lit 7 0) (Hw.slice 2 2 i)) (Hw.cat (Hw.slice 0 2 i) (Hw.lit 2 0)))
+def CG.merge {r : HwTy → Type} [Hw r] (old new : r (B 32)) (strb : r (B 4)) : r (B 32) :=
+  U.ofBits (fun (p : Nat) => Hw.mux (U.bit strb (Nat.div p 8)) (U.bit new p) (U.bit old p)) 32
+
+def CTb.step {r : HwTy → Type} [Hw r] (t : Timing) (mp : MParams) (s : CTbSt r) : r (HwTy.prod CTbSt.code CTbOut.code) :=
+  let g := CGen.unpack s.gen;
+  let cs := St.unpack s.ctrl;
+  let i := Hw.slice 8 6 g.lfsr;
+  let q := CReq.mk cs.calDone (CG.addr i) (U.bit g.lfsr 7) (Hw.xor g.lfsr (Hw.lit 32 1431655765)) (Hw.slice 16 4 g.lfsr);
+  -- the controller's response comes from its state (ready, rvalid) and its PHY input
+  -- (rdata): the cache's request this cycle does not change it
+  let co0 := Ctrl.step t cs (PortIn.mk U.lo U.lo (Hw.lit 24 0) (Hw.lit 128 0) (Hw.lit 16 0)) (PhyIn.unpack s.phy);
+  let po0 := PortOut.unpack (Hw.fst (Hw.snd co0));
+  let cr := C.step (CSt.unpack s.cache) q po0;
+  let resp := CResp.unpack (Hw.fst (Hw.snd cr));
+  let co := Ctrl.step t cs (PortIn.unpack (Hw.snd (Hw.snd cr))) (PhyIn.unpack s.phy);
+  let mo := Model.step t mp (MSt.unpack s.model) (Dfi.unpack (Hw.snd (Hw.snd co)));
+  let v := Viol.unpack (Hw.snd (Hw.snd mo));
+  let done := U.band q.valid resp.ready;
+  let wr := U.band done q.we;
+  let mismatch := U.band resp.rvalid (U.bnot (Hw.eq resp.rdata (Hw.memRead g.ref i)));
+  let gn := CGen.mk (Hw.mux done (Rnd.next g.lfsr) g.lfsr)
+    (Hw.memWrite g.ref wr i (CG.merge (Hw.memRead g.ref i) q.wdata q.wstrb))
+    (Hw.mux done (U.inc g.ops) g.ops) (Hw.mux mismatch (U.inc g.bad) g.bad);
+  let cst := CSt.unpack (Hw.fst cr);
+  let st := CTbSt.mk (Hw.fst cr) (Hw.fst co) (Hw.fst mo) (Hw.fst (Hw.snd mo)) (CGen.pack gn);
+  Hw.pair (CTbSt.pack st) (CTbOut.pack (CTbOut.mk cs.calDone v.err v.ecode g.ops g.bad cst.hits cst.misses v.writes v.reads))
+
+def CTb.init (t : Timing) : HwTy.El CTbSt.code :=
+  Bundle.toEl CTbSt.bundle (CTbSt.mk C.init (Ctrl.init t) Model.init (BitVec.ofNat 128 0, BitVec.ofNat 1 0)
+    (Bundle.toEl CGen.bundle (CGen.mk (BitVec.ofNat 32 2463534242) (fun (a : BitVec 6) => BitVec.ofNat 32 0)
+      (BitVec.ofNat 16 0) (BitVec.ofNat 16 0))))
+def CTb.circuit (t : Timing) (mp : MParams) : Circuit Bit CTbOut.code :=
+  Circuit.mk CTbSt.code (CTb.init t) (fun s x => CTb.step t mp (CTbSt.unpack s))
+def CTb.run (t : Timing) (mp : MParams) (n : Nat) : HwTy.El CTbOut.code :=
+  Tb.last (HwTy.unpack CTbOut.code 0) (Circuit.run (CTb.circuit t mp) (Tb.zeros n))
