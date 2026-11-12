@@ -122,3 +122,26 @@ Recorded as the work goes (agent ddr3, from 2026-11-12). Design notes:
   SING), CE1/SR routing (present), PLL lock (locked).
 * Lesson for #240: positional port order is fragile. Making a Prim's ports a named record,
   so that a swap is a type error, would be better (not done).
+
+## Working on the board (2026-11-12, evening)
+
+wiz-rv's doomTop with wiz-ddr3 f99ab70: calibration passes, 4.7 MB were written through
+the cache into DDR3 over the UART, and Doom ran its start-up from DDR. Three PHY faults
+were found on the board, in this order (each hidden behind the previous one):
+
+1. **OSERDESE2 RST tied high** (`X7.oserdes`, cat order; fixed in #240, 8350cd3f). No
+   output toggled. A plain-Verilog OSERDES blinked LD4, which ruled out the toolchain.
+2. **DQS a cycle early.** DQS's OSERDES runs on sys4x at 90° while its CLKDIV is at 0°, and
+   it put its word out one controller cycle before DQ's. Captured on the pins (DQ/DQS read
+   back through IDELAY+ISERDES during a write). Fixed by serialising DQS one cycle after DQ,
+   as LiteDRAM's A7 PHY does (it registers its DQS pattern).
+3. **The burst's tail cut off by the tristate.** The drive enable reaches the pad through
+   TQ (DATA_RATE_TQ BUF), faster than the data through the 8:1 serialiser, so only the
+   first beats of each write reached the pins. Fixed by holding the DQ/DQS enables two
+   cycles past the data window (LiteDRAM delays dq_oe through a tapped delay line for the
+   same reason).
+
+Diagnostics that found them (still in the memtest): R1/R0 (ISERDES bits ever high/low),
+the D0..DF dump (16 cycles of DQS+DQ samples from a write and from its read-back), and an
+MPR build (Timing.artyMpr) that proved the read path on its own. The calibration also
+sweeps a write shift in half memory clocks (9 tries) and prints the one it kept (`w=`).
