@@ -19,6 +19,11 @@ structure Gen (r : HwTy → Type) where
   bad : r (B 16)
   cycle : r (B 32)
   firstOp : r (B 32)    -- the cycle of the first operation (after calibration)
+  ridx : r (B 6)        -- the outstanding read's index
+  badAt : r (B 32)      -- the first mismatch: its cycle, index, data read and expected
+  badIdx : r (B 6)
+  badGot : r (B 128)
+  badExp : r (B 128)
   deriving Bundle
 
 structure TbSt (r : HwTy → Type) where
@@ -45,11 +50,16 @@ structure TbOut (r : HwTy → Type) where
   bad : r (B 16)
   cycle : r (B 32)
   firstOp : r (B 32)
+  badAt : r (B 32)
+  badIdx : r (B 6)
+  badGot : r (B 128)
+  badExp : r (B 128)
   deriving Bundle
 
--- the burst address of index i: row {i5, 0…, i4, i5}, bank i3..i1, column {i0, 0…, i0}
+-- the burst address of index i: row {1, i5, 0…, i4, i5}, bank i3..i1, column {i0, 0…, i0}
+-- (never burst 0: calibration wrote its pattern there)
 def Gen.addr {r : HwTy → Type} [Hw r] (i : r (B 6)) : r (B 24) :=
-  let row := Hw.cat (U.bit i 5) (Hw.cat (Hw.lit 11 0) (Hw.cat (U.bit i 4) (U.bit i 5)));
+  let row := Hw.cat (Hw.cat U.hi (U.bit i 5)) (Hw.cat (Hw.lit 10 0) (Hw.cat (U.bit i 4) (U.bit i 5)));
   let col := Hw.cat (U.bit i 0) (Hw.cat (Hw.lit 5 0) (U.bit i 0));
   Hw.slice 0 24 (Hw.cat row (Hw.cat (Hw.slice 1 3 i) col))
 -- the request the generator offers: write when bit 7 is set, index bits 13..8, mask
@@ -74,18 +84,22 @@ def Tb.step {r : HwTy → Type} [Hw r] (t : Timing) (mp : MParams) (s : TbSt r) 
   let ref := Hw.memWrite g.ref wAcc idx (Model.merge (Hw.memRead g.ref idx) req.wdata (Hw.not req.wmask));
   let mismatch := U.band back (U.bnot (Hw.eq po.rdata g.expect));
   let opDone := U.bor wAcc back;
+  let first := U.band mismatch (U.isZero g.bad);
   let gn := Gen.mk (Hw.mux accept (Rnd.next g.lfsr) g.lfsr) (Hw.mux rAcc U.hi (Hw.mux back U.lo g.waiting))
     (Hw.mux rAcc (Hw.memRead g.ref idx) g.expect) ref
     (Hw.mux opDone (U.inc g.ops) g.ops) (Hw.mux back (U.inc g.reads) g.reads) (Hw.mux mismatch (U.inc g.bad) g.bad)
-    (U.inc g.cycle) (Hw.mux (U.band accept (U.isZero g.ops)) g.cycle g.firstOp);
+    (U.inc g.cycle) (Hw.mux (U.band accept (U.isZero g.ops)) g.cycle g.firstOp)
+    (Hw.mux rAcc idx g.ridx)
+    (Hw.mux first g.cycle g.badAt) (Hw.mux first g.ridx g.badIdx) (Hw.mux first po.rdata g.badGot) (Hw.mux first g.expect g.badExp);
   let st := TbSt.mk (Hw.fst co) (Hw.fst mo) (Hw.fst (Hw.snd mo)) (Gen.pack gn);
   Hw.pair (TbSt.pack st) (TbOut.pack (TbOut.mk po.calDone po.calFail po.tap0 po.tap1 po.slip0 po.slip1 po.lat
-    v.err v.ecode v.at v.refs g.ops g.reads g.bad g.cycle g.firstOp))
+    v.err v.ecode v.at v.refs g.ops g.reads g.bad g.cycle g.firstOp g.badAt g.badIdx g.badGot g.badExp))
 
 def Tb.gen0 : HwTy.El Gen.code :=
   Bundle.toEl Gen.bundle (Gen.mk (BitVec.ofNat 32 2463534242) (BitVec.ofNat 1 0) (BitVec.ofNat 128 0)
     (fun (a : BitVec 6) => BitVec.ofNat 128 0) (BitVec.ofNat 16 0) (BitVec.ofNat 16 0) (BitVec.ofNat 16 0)
-    (BitVec.ofNat 32 0) (BitVec.ofNat 32 0))
+    (BitVec.ofNat 32 0) (BitVec.ofNat 32 0) (BitVec.ofNat 6 0) (BitVec.ofNat 32 0) (BitVec.ofNat 6 0)
+    (BitVec.ofNat 128 0) (BitVec.ofNat 128 0))
 def Tb.init (t : Timing) : HwTy.El TbSt.code :=
   Bundle.toEl TbSt.bundle (TbSt.mk (Ctrl.init t) Model.init (BitVec.ofNat 128 0, BitVec.ofNat 1 0) Tb.gen0)
 

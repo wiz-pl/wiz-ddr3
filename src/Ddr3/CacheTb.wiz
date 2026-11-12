@@ -31,9 +31,10 @@ structure CTbOut (r : HwTy → Type) where
   reads : r (B 16)
   deriving Bundle
 
--- word i: tag {i5, i4}, line {i3, i2}, word {i1, i0}
+-- word i: tag {1, 0…, i5, i4}, line {i3, i2}, word {i1, i0} (never burst 0: calibration
+-- wrote its pattern there)
 def CG.addr {r : HwTy → Type} [Hw r] (i : r (B 6)) : r (B 28) :=
-  Hw.cat (Hw.cat (Hw.lit 13 0) (Hw.slice 4 2 i)) (Hw.cat (Hw.cat (Hw.lit 7 0) (Hw.slice 2 2 i)) (Hw.cat (Hw.slice 0 2 i) (Hw.lit 2 0)))
+  Hw.cat (Hw.cat (Hw.cat U.hi (Hw.lit 12 0)) (Hw.slice 4 2 i)) (Hw.cat (Hw.cat (Hw.lit 7 0) (Hw.slice 2 2 i)) (Hw.cat (Hw.slice 0 2 i) (Hw.lit 2 0)))
 def CG.merge {r : HwTy → Type} [Hw r] (old new : r (B 32)) (strb : r (B 4)) : r (B 32) :=
   U.ofBits (fun (p : Nat) => Hw.mux (U.bit strb (Nat.div p 8)) (U.bit new p) (U.bit old p)) 32
 

@@ -50,12 +50,7 @@ structure SP.I where
 
 def SP.base : St HwTy.El := Bundle.ofEl St.bundle (Ctrl.init SP.t)
 def SP.st (c : SP.Sc) : St HwTy.El :=
-  let b := SP.base;
-  let sst := c.sst;
-  let stimer := c.stimer;
-  let swe := c.swe;
-  let refPend := c.refPend;
-  St.mk b.phase b.timer b.step b.rstN b.cke b.ras b.cas b.wen b.ba b.a (BitVec.ofNat 2 sst) (BitVec.ofNat 8 stimer) (BitVec.ofNat 1 swe) b.sba b.srow b.scol b.wdata b.wdm b.refCnt (BitVec.ofNat 1 refPend) b.wrHist b.rdHist b.prevRaw b.prevAl0 b.prevAl1 b.cst b.ctap b.cwin b.hits0 b.hits1 b.lat0 b.lat1 b.map0 b.map1 b.cpos b.run0s b.run0l b.run1s b.run1l b.best0s b.best0l b.best0p b.best1s b.best1l b.best1p b.slip0 b.slip1 b.tap0 b.tap1 b.latR b.dly0 b.dly1 b.calDone b.calFail b.dlyLd
+  St.mk (SP.base).phase (SP.base).timer (SP.base).step (SP.base).rstN (SP.base).cke (SP.base).ras (SP.base).cas (SP.base).wen (SP.base).ba (SP.base).a (BitVec.ofNat 2 c.sst) (BitVec.ofNat 8 c.stimer) (BitVec.ofNat 1 c.swe) (SP.base).sba (SP.base).srow (SP.base).scol (SP.base).wdata (SP.base).wdm (SP.base).refCnt (BitVec.ofNat 1 c.refPend) (SP.base).wrHist (SP.base).rdHist (SP.base).prevRaw (SP.base).prevAl0 (SP.base).prevAl1 (SP.base).cst (SP.base).ctap (SP.base).cwin (SP.base).hits0 (SP.base).hits1 (SP.base).lat0 (SP.base).lat1 (SP.base).map0 (SP.base).map1 (SP.base).cpos (SP.base).run0s (SP.base).run0l (SP.base).run1s (SP.base).run1l (SP.base).best0s (SP.base).best0l (SP.base).best0p (SP.base).best1s (SP.base).best1l (SP.base).best1p (SP.base).slip0 (SP.base).slip1 (SP.base).tap0 (SP.base).tap1 (SP.base).latR (SP.base).dly0 (SP.base).dly1 (SP.base).calDone (SP.base).calFail (SP.base).dlyLd
 def SP.bit (b : Bool) : HwTy.El Bit := Bool.toBits b
 def SP.req (x : SP.I) : Req HwTy.El :=
   Req.mk (SP.bit x.valid) (SP.bit x.we) (BitVec.ofNat 24 0) (BitVec.ofNat 128 0) (BitVec.ofNat 16 0)
