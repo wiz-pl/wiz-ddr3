@@ -1,0 +1,65 @@
+import Ddr3.Memtest
+import Hdl.Xilinx7
+-- The Arty A7-35T: the memory test's top level (a PLL wrapper around it) and its pin
+-- constraints. DDR3 pins from LiteX's digilent_arty.py (Digilent's MIG project): all in
+-- bank 34, SSTL135 (DIFF_SSTL135 for CK and DQS), SLEW FAST, DQ/DQS IN_TERM
+-- UNTUNED_SPLIT_40, internal VREF 0.675 V (nextpnr sets it by itself for a bank with SSTL
+-- inputs; the line is there for Vivado).
+
+-- clocks: VCO 800 MHz from the 100 MHz oscillator; the circuit at 100 MHz (CLKOUT0),
+-- sys4x 400 MHz (CLKOUT1), sys4x at 90° for DQS (CLKOUT2), the IDELAY reference 200 MHz
+-- (CLKOUT3); LOCKED to `locked`
+def Board.clocking : Clocking :=
+  X7.pll "10.0" 8 1 8 (.cons ("sys4x", (1, (2, "0.0"))) (.cons ("sys4xDqs", (2, (2, "90.0")))
+    (.cons ("ref200", (3, (4, "0.0"))) .nil))) (.cons "locked" .nil)
+
+-- port, package pin, properties
+structure XdcPin where
+  port : String
+  pin : String
+  props : String
+
+def Bd.sstl (port pin : String) : XdcPin := XdcPin.mk port pin "IOSTANDARD SSTL135 SLEW FAST"
+def Bd.sstlIn (port pin : String) : XdcPin := XdcPin.mk port pin "IOSTANDARD SSTL135 SLEW FAST IN_TERM UNTUNED_SPLIT_40"
+def Bd.diff (port pin : String) : XdcPin := XdcPin.mk port pin "IOSTANDARD DIFF_SSTL135 SLEW FAST"
+def Bd.diffIn (port pin : String) : XdcPin := XdcPin.mk port pin "IOSTANDARD DIFF_SSTL135 SLEW FAST IN_TERM UNTUNED_SPLIT_40"
+def Bd.lv (port pin : String) : XdcPin := XdcPin.mk port pin "IOSTANDARD LVCMOS33"
+def Bd.bus (f : String → String → XdcPin) (port : String) : Nat → List String → List XdcPin
+  | _, .nil => .nil
+  | k, .cons p ps => .cons (f (port <+> "_" <+> Hdl.show k) p) (Bd.bus f port (Nat.succ k) ps)
+def Bd.vec (port : String) : Nat → List String → List XdcPin
+  | _, .nil => .nil
+  | k, .cons p ps => .cons (Bd.lv (port <+> "[" <+> Hdl.show k <+> "]") p) (Bd.vec port (Nat.succ k) ps)
+def Bd.words (s : String) : List String := String.splitOn s " "
+
+def Board.pins : List XdcPin :=
+  List.append (Bd.bus Bd.sstl "ddr3_a" 0 (Bd.words "R2 M6 N4 T1 N6 R7 V6 U7 R8 V7 R6 U6 T6 T8"))
+  (List.append (Bd.bus Bd.sstl "ddr3_ba" 0 (Bd.words "R1 P4 P2"))
+  (List.append (Bd.bus Bd.sstl "ddr3_dm" 0 (Bd.words "L1 U1"))
+  (List.append (Bd.bus Bd.sstlIn "ddr3_dq" 0 (Bd.words "K5 L3 K3 L6 M3 M1 L4 M2 V4 T5 U4 V5 V1 T3 U3 R3"))
+  (.cons (Bd.sstl "ddr3_ras_n" "P3") (.cons (Bd.sstl "ddr3_cas_n" "M4") (.cons (Bd.sstl "ddr3_we_n" "P5")
+  (.cons (Bd.sstl "ddr3_cs_n" "U8") (.cons (Bd.sstl "ddr3_cke" "N5") (.cons (Bd.sstl "ddr3_odt" "R5")
+  (.cons (Bd.sstl "ddr3_reset_n" "K6")
+  (.cons (Bd.diff "ddr3_ck_p" "U9") (.cons (Bd.diff "ddr3_ck_n" "V9")
+  (.cons (Bd.diffIn "ddr3_dqs_p0" "N2") (.cons (Bd.diffIn "ddr3_dqs_n0" "N1")
+  (.cons (Bd.diffIn "ddr3_dqs_p1" "U2") (.cons (Bd.diffIn "ddr3_dqs_n1" "V2")
+  (.cons (Bd.lv "clk" "E3") (.cons (Bd.lv "uart_rx" "A9") (.cons (Bd.lv "uart_tx" "D10")
+  (Bd.vec "led" 0 (Bd.words "H5 J5 T9 T10")))))))))))))))))))))
+
+def Xdc.pinLine (p : XdcPin) : String :=
+  "set_property -dict { PACKAGE_PIN " <+> p.pin <+> " " <+> p.props <+> " } [get_ports {" <+> p.port <+> "}]\n"
+def Board.xdc : String :=
+  Hdl.concat (Hdl.map Xdc.pinLine Board.pins)
+  <+> "create_clock -period 10.000 [get_ports {clk}]\n"
+  <+> "set_property INTERNAL_VREF 0.675 [get_iobanks 34]\n"
+
+-- ports of a netlist (bit-level names, as the XDC needs them) without a pin, and pins
+-- without a port
+def Board.portNames (n : Netlist) : List String :=
+  let ω vn := Verilog.portIdents n;
+  List.append vn.ins vn.outs
+
+-- the memory test on the board: 2^24 bursts, 866 cycles per UART bit; its outputs the
+-- DDR3 pins and the board's
+def Board.memtestC (t : Timing) (ab : Nat) : Circuit MtIn.code (HwTy.prod Ddr3Pads.code Board.code) :=
+  Circuit.mk MtSt.code (Mt.init t) (fun s x => Mt.step t ab 866 (MtSt.unpack s) (MtIn.unpack x))

@@ -1,0 +1,65 @@
+import Hdl.Core
+-- Small helpers over `Hw`: bits by index, buses built bit by bit, multiplexers by a
+-- signal's value, and counters.
+
+def Bit : HwTy := HwTy.bits 1
+def B (n : Nat) : HwTy := HwTy.bits n
+
+def U.hi {r : HwTy → Type} [Hw r] : r Bit := Hw.lit 1 1
+def U.lo {r : HwTy → Type} [Hw r] : r Bit := Hw.lit 1 0
+def U.bit {r : HwTy → Type} [Hw r] {ω n : Nat} (x : r (B n)) (k : Nat) : r Bit := Hw.slice k 1 x
+def U.isLit {r : HwTy → Type} [Hw r] {ω n : Nat} (x : r (B n)) (k : Nat) : r Bit := Hw.eq x (Hw.lit n k)
+def U.isZero {r : HwTy → Type} [Hw r] {ω n : Nat} (x : r (B n)) : r Bit := Hw.eq x (Hw.lit n 0)
+def U.inc {r : HwTy → Type} [Hw r] {ω n : Nat} (x : r (B n)) : r (B n) := Hw.add x (Hw.lit n 1)
+def U.dec {r : HwTy → Type} [Hw r] {ω n : Nat} (x : r (B n)) : r (B n) := Hw.sub x (Hw.lit n 1)
+-- a down-counter that stops at 0
+def U.down {r : HwTy → Type} [Hw r] {ω n : Nat} (x : r (B n)) : r (B n) := Hw.mux (U.isZero x) x (U.dec x)
+def U.band {r : HwTy → Type} [Hw r] (a b : r Bit) : r Bit := Hw.and a b
+def U.bor {r : HwTy → Type} [Hw r] (a b : r Bit) : r Bit := Hw.or a b
+def U.bnot {r : HwTy → Type} [Hw r] (a : r Bit) : r Bit := Hw.not a
+
+-- a bus of `n` bits whose bit `i` is `f (k + i)`, and whose bit `i` is `f i`
+def U.ofBitsFrom {r : HwTy → Type} [Hw r] (f : Nat → r Bit) : (ω k n : Nat) → r (B n)
+  | _, .zero => Hw.lit 0 0
+  | k, .succ n => Hw.slice 0 (Nat.succ n) (Hw.cat (U.ofBitsFrom f (Nat.succ k) n) (f k))
+def U.ofBits {r : HwTy → Type} [Hw r] (f : Nat → r Bit) (n : Nat) : r (B n) := U.ofBitsFrom f 0 n
+
+-- `f k` where `sel = k`, for k < n; `f 0` otherwise
+def U.select {r : HwTy → Type} [Hw r] {ω w : Nat} {ω t : HwTy} (sel : r (B w)) (f : Nat → r t) : (ω n : Nat) → r t
+  | .zero => f 0
+  | .succ n => Hw.mux (U.isLit sel n) (f n) (U.select sel f n)
+
+-- `x` with the bit at index `sel` (a signal) set to `b`, for a bus of `n` bits
+def U.setBit {r : HwTy → Type} [Hw r] {ω w : Nat} (n : Nat) (x : r (B n)) (sel : r (B w)) (b : r Bit) : r (B n) :=
+  U.ofBits (fun (k : Nat) => Hw.mux (U.isLit sel k) b (U.bit x k)) n
+
+-- the bit at index `sel` (a signal)
+def U.getBit {r : HwTy → Type} [Hw r] {ω w n : Nat} (x : r (B n)) (sel : r (B w)) : r Bit :=
+  U.select sel (fun (k : Nat) => U.bit x k) n
+
+-- the meta-level maximum
+def U.max (a b : Nat) : Nat := match Nat.lt a b with
+  | .true => b
+  | .false => a
+
+-- eight of a code, and their operations (by a bank number that is a signal)
+def V.t (t : HwTy) : Nat → HwTy
+  | .zero => t
+  | .succ n => HwTy.prod t (V.t t n)
+def V.getN {r : HwTy → Type} [Hw r] {ω t : HwTy} : (ω n : Nat) → r (V.t t n) → Nat → r t
+  | .zero, v, _ => v
+  | .succ n, v, .zero => Hw.fst v
+  | .succ n, v, .succ k => V.getN n (Hw.snd v) k
+def V.get {r : HwTy → Type} [Hw r] {ω t : HwTy} (v : r (V.t t 7)) (k : Nat) : r t := V.getN 7 v k
+def V.ofN {r : HwTy → Type} [Hw r] {ω t : HwTy} : (ω n : Nat) → (Nat → r t) → r (V.t t n)
+  | .zero, f => f 0
+  | .succ n, f => Hw.pair (f 0) (V.ofN n (fun (k : Nat) => f (Nat.succ k)))
+def V.of {r : HwTy → Type} [Hw r] {ω t : HwTy} (f : Nat → r t) : r (V.t t 7) := V.ofN 7 f
+
+-- pseudo-random data: a 32-bit Galois LFSR (taps 32, 22, 2, 1)
+def Rnd.next {r : HwTy → Type} [Hw r] (x : r (B 32)) : r (B 32) :=
+  let sh := Hw.cat (Hw.lit 1 0) (Hw.slice 1 31 x);
+  Hw.mux (U.bit x 0) (Hw.xor sh (Hw.lit 32 3489660929)) sh
+-- 128 bits of data from one of its states
+def Rnd.data {r : HwTy → Type} [Hw r] (x : r (B 32)) : r (B 128) :=
+  Hw.cat (Hw.cat (Hw.xor x (Hw.lit 32 2779096485)) (Hw.not x)) (Hw.cat (Hw.xor x (Hw.lit 32 1515870810)) x)

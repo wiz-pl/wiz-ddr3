@@ -1,0 +1,245 @@
+import Ddr3.Board
+import Ddr3.Tb
+import Hdl.Arty
+import Sys
+import Text
+-- The flow driver: `ddr3 COMMAND [--chipdb DIR] [--db DIR]` (wiz-arty's, for one design).
+--
+--   sim [N]   the controller against the behavioural DDR3 model for N cycles (values):
+--             calibration's results, the model's first timing violation, the traffic
+--             generator's operations and mismatches
+--   gen       build/memtest.v (the memory test under its PLL wrapper), build/memtest.xdc
+--   bit       gen, then yosys synth_xilinx, nextpnr-xilinx, fasm2frames, xc7frames2bit:
+--             build/a35t/memtest.bit
+--
+-- There is no load: openFPGALoader -b arty_a7_35t build/a35t/memtest.bit (SRAM only).
+
+------------------------------------------------------------------------------------
+-- Steps (as wiz-icestick-uart's driver)
+
+def unwords : List String → String
+  | .nil => ""
+  | .cons a as => a <+> " " <+> unwords as
+
+def say (s : String) : EIO Unit := EIO.lift (IO.println s)
+
+def EIO.forEach {A : Type} (f : A → EIO Unit) : List A → EIO Unit
+  | .nil => EIO.pure ()
+  | .cons x xs => EIO.bind (f x) (fun u => EIO.forEach f xs)
+
+-- run a tool with this program's streams; a failure stops the flow
+def tool (cmd : String) (args : List String) : EIO Unit := do
+  say ("$ " <+> cmd <+> " " <+> unwords args);
+  st ← Process.run cmd args;
+  match ExitStatus.success st with
+  | .true => EIO.pure ()
+  | .false => EIO.fail (cmd <+> ": " <+> ExitStatus.toString st)
+
+-- run a tool and return what it printed
+def toolOutput (cmd : String) (args : List String) : EIO String := do
+  say ("$ " <+> cmd <+> " " <+> unwords args);
+  o ← Process.output cmd args "";
+  match ExitStatus.success o.status with
+  | .true => EIO.pure o.stdout
+  | .false => EIO.fail (cmd <+> ": " <+> ExitStatus.toString o.status <+> "\n" <+> o.stdout <+> o.stderr)
+
+def ensureDir (p : String) : EIO Unit := do
+  d ← EIO.lift (FS.isDir p);
+  match d with
+  | .true => EIO.pure ()
+  | .false => FS.createDir p
+
+def build (file : String) : String := "build/" <+> file
+
+-- the vector file, 4096 lines at a time
+def takeDrop {A : Type} : Nat → List A → List A → List A × List A
+  | .zero, xs, acc => (Hdl.reverse acc, xs)
+  | .succ k, .nil, acc => (Hdl.reverse acc, .nil)
+  | .succ k, .cons x xs, acc => takeDrop k xs (.cons x acc)
+def writeVec (path : String) : Nat → List String → EIO Unit
+  | .zero, _ => EIO.pure ()
+  | .succ fuel, ls => match ls with
+    | .nil => EIO.pure ()
+    | .cons _ _ =>
+      let ω r := takeDrop 4096 ls .nil;
+      EIO.bind (FS.appendFile path (Hdl.concat r.1)) (fun u => writeVec path fuel r.2)
+
+def leavesEq : List (List Nat) → List (List Nat) → Bool
+  | .nil, .nil => .true
+  | .cons a as, .cons b bs => Bool.and (Hdl.natsEq a b) (leavesEq as bs)
+  | _, _ => .false
+
+def check (what : String) (ok : Bool) : EIO Unit := match ok with
+  | .true => say ("  ok: " <+> what)
+  | .false => EIO.fail ("FAILED: " <+> what)
+
+------------------------------------------------------------------------------------
+-- sim
+
+def showOut (o : HwTy.El TbOut.code) : String :=
+  let ω v := Bundle.ofEl TbOut.bundle o;
+  "calDone=" <+> Hdl.show v.calDone.toNat <+> " calFail=" <+> Hdl.show v.calFail.toNat
+  <+> " tap0=" <+> Hdl.show v.tap0.toNat <+> " slip0=" <+> Hdl.show v.slip0.toNat
+  <+> " tap1=" <+> Hdl.show v.tap1.toNat <+> " slip1=" <+> Hdl.show v.slip1.toNat <+> " lat=" <+> Hdl.show v.lat.toNat
+  <+> "\nviolation=" <+> Hdl.show v.err.toNat <+> " code=" <+> Hdl.show v.ecode.toNat <+> " at=" <+> Hdl.show v.at.toNat
+  <+> " refreshes=" <+> Hdl.show v.refs.toNat
+  <+> "\nops=" <+> Hdl.show v.ops.toNat <+> " reads=" <+> Hdl.show v.reads.toNat <+> " mismatches=" <+> Hdl.show v.bad.toNat
+  <+> " cycle=" <+> Hdl.show v.cycle.toNat <+> " firstOp=" <+> Hdl.show v.firstOp.toNat
+
+def simRun (n : Nat) : EIO Unit := say (showOut (Tb.run Timing.sim MParams.default n))
+
+------------------------------------------------------------------------------------
+-- gen, bit
+
+def design : Netlist := Circuit.netlist "memtest" (Board.memtestC Timing.arty 24)
+
+def gen : EIO Unit := do
+  ensureDir "build";
+  let n := design;
+  say ("memtest: " <+> Hdl.show (Netlist.size n) <+> " netlist nodes, " <+> Hdl.show (List.length n.regs) <+> " registers");
+  (match n.errors with
+    | .nil => EIO.pure ()
+    | es => EIO.fail ("netlist errors: " <+> unwords es));
+  FS.writeFile (build "memtest.v") (Verilog.emitTop n Board.clocking);
+  FS.writeFile (build "memtest.xdc") Board.xdc
+
+structure Dirs where
+  chipdb : String
+  db : String
+
+def lines (s : String) : List String := String.splitOn s "\n"
+def keep (p : String → Bool) : List String → List String
+  | .nil => .nil
+  | .cons l ls => match p l with
+    | .true => .cons l (keep p ls)
+    | .false => keep p ls
+def sayAll : List String → EIO Unit
+  | .nil => EIO.pure ()
+  | .cons l ls => EIO.bind (say ("  " <+> String.trim l)) (fun u => sayAll ls)
+
+-- the cells yosys's `stat` counts that matter here (the I/O buffers and the clock
+-- buffer are there for every design)
+def cellLine (l : String) : Bool :=
+  List.any (fun (c : String) => String.contains l c)
+    (.cons "LUT" (.cons "FD" (.cons "CARRY4" (.cons "RAMB" (.cons "DSP48E1" (.cons "RAM32" (.cons "RAM64"
+    (.cons "SRL" (.cons "MUXF" .nil)))))))))
+def timingLine (l : String) : Bool := String.contains l "Max frequency for clock"
+def lastOf : List String → List String
+  | .nil => .nil
+  | .cons l .nil => .cons l .nil
+  | .cons _ ls => lastOf ls
+
+-- yosys's DSP mapping (xilinx_dsp) can leave a flip-flop whose register it copied into
+-- a DSP48E1 with INIT x. nextpnr writes such a flip-flop with its primitive's default
+-- (FDRE, FDCE: 0; FDSE, FDPE: 1); the simulation models say x. The synthesised netlist
+-- gets the same defaults, so that postsim simulates what the bitstream holds; the count
+-- is reported.
+def xInit1 (prim v : String) (acc : String × Nat) : String × Nat :=
+  let ω pat := prim <+> " #(\n    .INIT(1'hx)";
+  let ω parts := String.splitOn acc.1 pat;
+  (String.intercalate (prim <+> " #(\n    .INIT(1'h" <+> v <+> ")") parts, acc.2 + (List.length parts - 1))
+def xInits (v : String) : String × Nat :=
+  xInit1 "FDPE" "1" (xInit1 "FDSE" "1" (xInit1 "FDCE" "0" (xInit1 "FDRE" "0" (v, 0))))
+
+def dev (d : Arty.Device) (file : String) : String := build (Arty.Device.name d <+> "/" <+> file)
+
+def synth (name : String) : EIO Unit := do
+  tool "yosys" (.cons "-q" (.cons "-l" (.cons (build (name <+> ".yosys.log")) (.cons "-p"
+    (.cons ("synth_xilinx -flatten -abc9 -arch xc7 -top " <+> name <+> "; tee -q -o " <+> build (name <+> ".stat")
+      <+> " stat; write_json " <+> build (name <+> ".json")
+      <+> "; write_verilog -noattr " <+> build (name <+> "_syn.v"))
+    (.cons (build (name <+> ".v")) .nil))))));
+  st ← FS.readFile (build (name <+> ".stat"));
+  say (name <+> ": utilisation (yosys)");
+  sayAll (keep cellLine (lines st));
+  syn ← FS.readFile (build (name <+> "_syn.v"));
+  let fixed := xInits syn;
+  (match Nat.beq fixed.2 0 with
+    | .true => EIO.pure ()
+    | .false => say ("  " <+> Hdl.show fixed.2 <+> " flip-flops lost their initial value in synthesis (INIT x);"
+        <+> " given their primitive's default for postsim, as nextpnr does in the bitstream"));
+  FS.writeFile (build (name <+> "_syn.v")) fixed.1
+
+def pnr (dirs : Dirs) (d : Arty.Device) (name : String) : EIO Unit := do
+  let part := Arty.Device.xrayPart d;
+  tool "nextpnr-xilinx" (.cons "--chipdb" (.cons (dirs.chipdb <+> "/" <+> Arty.Device.chipdb d <+> ".bin")
+    (.cons "--xdc" (.cons (build "memtest.xdc") (.cons "--json" (.cons (build (name <+> ".json"))
+    (.cons "--fasm" (.cons (dev d (name <+> ".fasm")) (.cons "--log" (.cons (dev d (name <+> ".nextpnr.log"))
+    (.cons "-q" .nil)))))))))));
+  lg ← FS.readFile (dev d (name <+> ".nextpnr.log"));
+  say (name <+> " on " <+> Arty.Device.part d <+> ": timing (nextpnr)");
+  -- (nextpnr reports after placement and twice after routing: the last one counts)
+  sayAll (lastOf (keep timingLine (lines lg)));
+  fr ← toolOutput "fasm2frames" (.cons "--part" (.cons part (.cons "--db-root" (.cons (dirs.db <+> "/artix7")
+    (.cons (dev d (name <+> ".fasm")) .nil)))));
+  FS.writeFile (dev d (name <+> ".frames")) fr;
+  tool "xc7frames2bit" (.cons "--part_file" (.cons (dirs.db <+> "/artix7/" <+> part <+> "/part.yaml")
+    (.cons "--part_name" (.cons part (.cons "--frm_file" (.cons (dev d (name <+> ".frames"))
+    (.cons "--output_file" (.cons (dev d (name <+> ".bit")) .nil))))))))
+
+def bit (dirs : Dirs) : EIO Unit := do
+  gen;
+  synth "memtest";
+  ensureDir (build "a35t");
+  pnr dirs Arty.Device.default "memtest"
+
+------------------------------------------------------------------------------------
+-- The command line
+
+def usage : String := "usage: ddr3 sim [CYCLES] | gen | bit  [--chipdb DIR] [--db DIR]"
+
+def envOr (k : String) (v : Option String) : EIO String := match v with
+  | .some x => EIO.pure x
+  | .none => do
+    e ← EIO.lift (Env.get k);
+    match e with
+    | .some x => EIO.pure x
+    | .none => EIO.fail ("no --" <+> (match String.eq k "ARTY_CHIPDB" with
+      | .true => "chipdb"
+      | .false => "db") <+> " DIR and no $" <+> k <+> " (the devShell sets it)")
+
+structure Args where
+  words : List String
+  chipdb : Option String
+  db : Option String
+
+-- the option whose value comes next
+inductive Want where
+  | word
+  | chipdb
+  | db
+
+def parse : List String → Want → Args → Option Args
+  | .nil, .word, a => .some (Args.mk (List.reverse a.words) a.chipdb a.db)
+  | .nil, _, a => .none
+  | .cons w ws, .chipdb, a => parse ws .word (Args.mk a.words (.some w) a.db)
+  | .cons w ws, .db, a => parse ws .word (Args.mk a.words a.chipdb (.some w))
+  | .cons w ws, .word, a => match String.eq w "--chipdb", String.eq w "--db" with
+    | .true, _ => parse ws .chipdb a
+    | _, .true => parse ws .db a
+    | _, _ => parse ws .word (Args.mk (.cons w a.words) a.chipdb a.db)
+
+def dirsOf (a : Args) : EIO Dirs := do
+  c ← envOr "ARTY_CHIPDB" a.chipdb;
+  b ← envOr "PRJXRAY_DB_DIR" a.db;
+  EIO.pure (Dirs.mk c b)
+
+def natOf (s : String) : Nat := match String.parseNat s with
+  | .some n => n
+  | .none => 4000
+
+def runArgs (a : Args) : EIO Unit := match a.words with
+  | .cons cmd rest => (match String.eq cmd "sim", String.eq cmd "gen", String.eq cmd "bit" with
+    | .true, _, _ => simRun (match rest with
+      | .cons w _ => natOf w
+      | .nil => 4000)
+    | _, .true, _ => gen
+    | _, _, .true => EIO.bind (dirsOf a) bit
+    | _, _, _ => EIO.fail usage)
+  | .nil => EIO.fail usage
+
+def run (args : List String) : EIO Unit := match parse args .word (Args.mk .nil .none .none) with
+  | .some a => runArgs a
+  | .none => EIO.fail usage
+
+def main : IO Unit := EIO.toIO (EIO.bind (EIO.lift IO.args) run)

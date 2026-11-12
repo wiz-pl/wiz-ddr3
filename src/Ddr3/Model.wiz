@@ -1,0 +1,258 @@
+import Ddr3.Ctrl
+-- A behavioural DDR3 device at the controller's interface (`Dfi` in, `PhyIn` out), for
+-- simulation: it stores what is written, returns it on reads the way the PHY would (the
+-- ISERDES words, with a read latency and a bit offset the calibration must find, and
+-- garbage outside a window of good IDELAY taps), and checks every JEDEC constraint the
+-- controller has to keep, in controller cycles, against the timing record:
+--
+--   ACT      bank closed; tRP after its PRE, tRC after its ACT; tRFC after REF; tMOD after MRS
+--   RD, WR   bank open; tRCD after its ACT; RD tWTR after a WR, WR tRTW after a RD
+--   PRE      tRAS after its ACT, tWRP after its WR, tRTP after its RD
+--   REF      every bank closed; tRP after the last PRE; tRFC after the last REF
+--   MRS      every bank closed; tMRD after the last MRS; in order MR2, MR3, MR1, MR0, then ZQCL
+--   any      not within tRFC of a REF, tZQinit of the ZQCL; CKE high tXPR before the first
+--            command; RESET# low tReset, then high tCke before CKE
+--   refresh  in service, never more than 9 × tREFI cycles without a REF
+--   writes   DQS driven the cycle before the data (preamble) and toggling with it
+--
+-- The first violation is kept (sticky): its code and the cycle it happened in.
+
+def B8 : HwTy := HwTy.bits 8
+
+-- error codes
+def E.actOpen : Nat := 1
+def E.actRp : Nat := 2
+def E.actRc : Nat := 3
+def E.rfc : Nat := 4
+def E.mod : Nat := 5
+def E.rwClosed : Nat := 6
+def E.rcd : Nat := 7
+def E.wtr : Nat := 8
+def E.rtw : Nat := 9
+def E.ras : Nat := 10
+def E.wrp : Nat := 11
+def E.rtp : Nat := 12
+def E.refOpen : Nat := 13
+def E.refRp : Nat := 14
+def E.mrsOpen : Nat := 15
+def E.mrd : Nat := 16
+def E.order : Nat := 17
+def E.zq : Nat := 18
+def E.xpr : Nat := 19
+def E.reset : Nat := 20
+def E.cke : Nat := 21
+def E.refi : Nat := 22
+def E.dqs : Nat := 23
+
+-- one bank: open, its row, cycles since its ACT, PRE, RD, WR (saturating at 255)
+structure Bank (r : HwTy → Type) where
+  open : r Bit
+  row : r (B 14)
+  sAct : r B8
+  sPre : r B8
+  sRd : r B8
+  sWr : r B8
+  deriving Bundle
+
+def Sat.inc {r : HwTy → Type} [Hw r] {ω n : Nat} (x : r (B n)) : r (B n) :=
+  Hw.mux (Hw.eq x (Hw.lit n (Nat.pow 2 n - 1))) x (U.inc x)
+-- `x ≥ k` (k a meta number)
+def Sat.ge {r : HwTy → Type} [Hw r] {ω n : Nat} (x : r (B n)) (k : Nat) : r Bit := U.bnot (Hw.ult x (Hw.lit n k))
+
+-- the checker's output
+structure Viol (r : HwTy → Type) where
+  err : r Bit
+  ecode : r B8
+  at : r (B 32)
+  refs : r (B 16)       -- refreshes seen
+  writes : r (B 16)
+  reads : r (B 16)
+  deriving Bundle
+
+structure MSt (r : HwTy → Type) where
+  mem : r (HwTy.mem 24 128)
+  banks : r (V.t Bank.code 7)
+  cycle : r (B 32)
+  sRef : r (B 16)
+  sMrs : r B8
+  sZq : r B8
+  sPreAny : r B8
+  sRdAny : r B8
+  sWrAny : r B8
+  sRst : r (B 16)       -- cycles in the current RESET# level
+  rstPrev : r Bit       -- RESET# last cycle
+  sCke : r (B 16)       -- cycles CKE has been high
+  rstSeen : r Bit       -- RESET# went high after being low long enough
+  stage : r (B 3)       -- init: MRS/ZQCL seen in order (5: done)
+  zqDone : r Bit
+  err : r Bit
+  ecode : r B8
+  at : r (B 32)
+  refs : r (B 16)
+  writes : r (B 16)
+  reads : r (B 16)
+  -- write data: the address of a WR presented 1 and 2 cycles ago
+  wa1 : r (B 24)
+  wv1 : r Bit
+  wa2 : r (B 24)
+  wv2 : r Bit
+  dqsPrev : r Bit       -- DQS was driven last cycle
+  -- reads: a pipe of `lat` stages (valid, data), and the burst out now and the one before
+  pipe : r (V.t (HwTy.prod Bit (B 128)) 7)
+  outV : r Bit
+  outD : r (B 128)
+  prevV : r Bit
+  prevD : r (B 128)
+  -- the IDELAY taps the controller set
+  tap0 : r (B 5)
+  tap1 : r (B 5)
+  deriving Bundle
+
+-- The model's parameters: the read latency in cycles from the RD's cycle to its first
+-- word (1 ≤ lat ≤ 8), the bit offset of the burst in the ISERDES words (0 ≤ off ≤ 7),
+-- and each lane's good taps [lo, hi].
+structure MParams where
+  lat : Nat
+  off : Nat
+  lo0 : Nat
+  hi0 : Nat
+  lo1 : Nat
+  hi1 : Nat
+
+-- the first violation (the first in the list among those of one cycle)
+def Viol.first {r : HwTy → Type} [Hw r] : List (r Bit × Nat) → r Bit × r B8
+  | .nil => (U.lo, Hw.lit 8 0)
+  | .cons p ps =>
+    let rest := Viol.first ps;
+    (Hw.or p.1 rest.1, Hw.mux p.1 (Hw.lit 8 p.2) rest.2)
+
+-- a byte-masked write: bytes whose DM bit is 1 keep the old value
+def Model.merge {r : HwTy → Type} [Hw r] (old new : r (B 128)) (dm : r (B 16)) : r (B 128) :=
+  U.ofBits (fun (p : Nat) => Hw.mux (U.bit dm (Nat.div p 16 * 2 + Nat.div (Nat.mod p 16) 8)) (U.bit old p) (U.bit new p)) 128
+
+-- the ISERDES word now: DQ j, sample k is beat k - off of the burst out now (k ≥ off) or
+-- beat 8 + k - off of the one before; inverted on a lane whose tap is bad, 0 where no
+-- burst is
+def Model.rawBit {r : HwTy → Type} [Hw r] (mp : MParams) (s : MSt r) (bad0 bad1 : r Bit) (p : Nat) : r Bit :=
+  let ω j := Nat.div p 8;
+  let ω k := Nat.mod p 8;
+  let ω bad := match Nat.lt j 8 with
+    | .true => bad0
+    | .false => bad1;
+  Hw.xor bad (match Nat.lt k mp.off with
+    | .true => U.band s.prevV (U.bit s.prevD ((8 + k - mp.off) * 16 + j))
+    | .false => U.band s.outV (U.bit s.outD ((k - mp.off) * 16 + j)))
+def Model.raw {r : HwTy → Type} [Hw r] (mp : MParams) (s : MSt r) : r (B 128) :=
+  let bad0 := U.bor (Hw.ult s.tap0 (Hw.lit 5 mp.lo0)) (Hw.ult (Hw.lit 5 mp.hi0) s.tap0);
+  let bad1 := U.bor (Hw.ult s.tap1 (Hw.lit 5 mp.lo1)) (Hw.ult (Hw.lit 5 mp.hi1) s.tap1);
+  U.ofBits (fun (p : Nat) => Model.rawBit mp s bad0 bad1 p) 128
+
+-- bank k's next state, given the command
+def Model.bankNext {r : HwTy → Type} [Hw r] (d : Dfi r) (isAct isPre isRd isWr : r Bit) (k : Nat) (b : Bank r) : r Bank.code :=
+  let me := U.isLit d.ba k;
+  let one := Hw.lit 8 1;
+  Bank.pack (Bank.mk (Hw.mux (U.band me isAct) U.hi (Hw.mux (U.band me isPre) U.lo b.open))
+    (Hw.mux (U.band me isAct) d.a b.row)
+    (Hw.mux (U.band me isAct) one (Sat.inc b.sAct)) (Hw.mux (U.band me isPre) one (Sat.inc b.sPre))
+    (Hw.mux (U.band me isRd) one (Sat.inc b.sRd)) (Hw.mux (U.band me isWr) one (Sat.inc b.sWr)))
+
+def Model.bank {r : HwTy → Type} [Hw r] (s : MSt r) (k : Nat) : Bank r := Bank.unpack (V.get s.banks k)
+
+-- the MRS expected at an init stage: MR2, MR3, MR1, MR0
+def Model.expect {r : HwTy → Type} [Hw r] (stage : r (B 3)) : r (B 3) :=
+  Hw.mux (U.isLit stage 0) (Hw.lit 3 2) (Hw.mux (U.isLit stage 1) (Hw.lit 3 3) (Hw.mux (U.isLit stage 2) (Hw.lit 3 1) (Hw.lit 3 0)))
+
+-- the pipe's next stages
+def Model.pipeNext {r : HwTy → Type} [Hw r] (s : MSt r) (inp : r (HwTy.prod Bit (B 128))) : r (V.t (HwTy.prod Bit (B 128)) 7) :=
+  V.of (fun (k : Nat) => match Nat.beq k 0 with
+    | .true => inp
+    | .false => V.get s.pipe (k - 1))
+
+def Model.step {r : HwTy → Type} [Hw r] (t : Timing) (mp : MParams) (s : MSt r) (d : Dfi r) :
+    r (HwTy.prod MSt.code (HwTy.prod PhyIn.code Viol.code)) :=
+  let isAct := U.band (U.band (U.bnot d.ras_n) d.cas_n) d.we_n;
+  let isRd := U.band (U.band d.ras_n (U.bnot d.cas_n)) d.we_n;
+  let isWr := U.band (U.band d.ras_n (U.bnot d.cas_n)) (U.bnot d.we_n);
+  let isPre := U.band (U.band (U.bnot d.ras_n) d.cas_n) (U.bnot d.we_n);
+  let isRef := U.band (U.band (U.bnot d.ras_n) (U.bnot d.cas_n)) d.we_n;
+  let isMrs := U.band (U.band (U.bnot d.ras_n) (U.bnot d.cas_n)) (U.bnot d.we_n);
+  let isZq := U.band (U.band d.ras_n d.cas_n) (U.bnot d.we_n);
+  let any := U.bnot (U.band (U.band d.ras_n d.cas_n) d.we_n);
+  let bank := Bank.unpack (U.select d.ba (fun (k : Nat) => V.get s.banks k) 8);
+  let allClosed := U.bnot (U.bor (U.bor (U.bor (Model.bank s 0).open (Model.bank s 1).open)
+    (U.bor (Model.bank s 2).open (Model.bank s 3).open))
+    (U.bor (U.bor (Model.bank s 4).open (Model.bank s 5).open) (U.bor (Model.bank s 6).open (Model.bank s 7).open)));
+  let initing := Hw.ult s.stage (Hw.lit 3 5);
+  let badMrs := U.band isMrs (U.band initing (U.bor (U.bnot (Hw.ult s.stage (Hw.lit 3 4))) (U.bnot (Hw.eq d.ba (Model.expect s.stage)))));
+  let badZq := U.band isZq (U.bnot (U.isLit s.stage 4));
+  let rising := U.band d.rst_n (U.bnot s.rstPrev);
+  let ckeRise := U.band d.cke (U.isZero s.sCke);
+  let viol := Viol.first (.cons (U.band isAct bank.open, E.actOpen)
+    (.cons (U.band isAct (U.bnot (Sat.ge bank.sPre t.tRP)), E.actRp)
+    (.cons (U.band isAct (U.bnot (Sat.ge bank.sAct t.tRC)), E.actRc)
+    (.cons (U.band any (U.bnot (Sat.ge s.sRef t.tRFC)), E.rfc)
+    (.cons (U.band (U.band any (U.bnot isMrs)) (U.bnot (Sat.ge s.sMrs t.tMOD)), E.mod)
+    (.cons (U.band (U.bor isRd isWr) (U.bnot bank.open), E.rwClosed)
+    (.cons (U.band (U.bor isRd isWr) (U.bnot (Sat.ge bank.sAct t.tRCD)), E.rcd)
+    (.cons (U.band isRd (U.bnot (Sat.ge s.sWrAny (t.wrLatency + 1 + t.tWTR))), E.wtr)
+    (.cons (U.band isWr (U.bnot (Sat.ge s.sRdAny t.tRTW)), E.rtw)
+    (.cons (U.band (U.band isPre bank.open) (U.bnot (Sat.ge bank.sAct t.tRAS)), E.ras)
+    (.cons (U.band (U.band isPre bank.open) (U.bnot (Sat.ge bank.sWr t.tWRP)), E.wrp)
+    (.cons (U.band (U.band isPre bank.open) (U.bnot (Sat.ge bank.sRd t.tRTP)), E.rtp)
+    (.cons (U.band isRef (U.bnot allClosed), E.refOpen)
+    (.cons (U.band isRef (U.bnot (Sat.ge s.sPreAny t.tRP)), E.refRp)
+    (.cons (U.band isMrs (U.bnot allClosed), E.mrsOpen)
+    (.cons (U.band isMrs (U.bnot (Sat.ge s.sMrs t.tMRD)), E.mrd)
+    (.cons (U.bor (U.bor badMrs badZq) (U.band (U.band any (U.bnot (U.bor isMrs isZq))) initing), E.order)
+    (.cons (U.band any (U.band s.zqDone (U.bnot (Sat.ge s.sZq t.tZQinit))), E.zq)
+    (.cons (U.band any (U.bnot (Sat.ge s.sCke t.tXPR)), E.xpr)
+    (.cons (U.band rising (U.bnot (Sat.ge s.sRst t.tReset)), E.reset)
+    (.cons (U.band ckeRise (U.bor (U.bnot s.rstSeen) (U.bnot (Sat.ge s.sRst t.tCke))), E.cke)
+    (.cons (U.band s.zqDone (Hw.ult (Hw.lit 16 (9 * t.tREFI)) s.sRef), E.refi)
+    (.cons (U.band d.dqOe (U.bnot (U.band s.dqsPrev (U.band d.dqsOe d.dqsOn))), E.dqs)
+    (.cons (U.band s.wv2 (U.bnot d.dqOe), E.dqs) .nil))))))))))))))))))))))));
+  let first := U.band viol.1 (U.bnot s.err);
+  -- the burst address of a RD or WR: the bank's open row, the bank, A9..A3
+  let addr := Hw.cat bank.row (Hw.cat d.ba (Hw.slice 3 7 d.a));
+  let mem1 := Hw.memWrite s.mem s.wv2 s.wa2 (Model.merge (Hw.memRead s.mem s.wa2) d.wrdata d.wrdm);
+  let rdData := Hw.memRead s.mem addr;
+  let pipe := Model.pipeNext s (Hw.pair isRd rdData);
+  let outNext := match Nat.beq mp.lat 1 with
+    | .true => Hw.pair isRd rdData
+    | .false => V.get s.pipe (mp.lat - 2);
+  let one8 := Hw.lit 8 1;
+  let banks := V.of (fun (k : Nat) => Model.bankNext d isAct isPre isRd isWr k (Model.bank s k));
+  let st := MSt.mk mem1 banks (U.inc s.cycle)
+    (Hw.mux isRef (Hw.lit 16 1) (Hw.mux isZq (Hw.lit 16 t.tRFC) (Sat.inc s.sRef)))
+    (Hw.mux isMrs one8 (Sat.inc s.sMrs)) (Hw.mux isZq one8 (Sat.inc s.sZq)) (Hw.mux isPre one8 (Sat.inc s.sPreAny))
+    (Hw.mux isRd one8 (Sat.inc s.sRdAny)) (Hw.mux isWr one8 (Sat.inc s.sWrAny))
+    (Hw.mux (Hw.eq d.rst_n s.rstPrev) (Sat.inc s.sRst) (Hw.lit 16 1)) d.rst_n
+    (Hw.mux d.cke (Sat.inc s.sCke) (Hw.lit 16 0))
+    (Hw.or s.rstSeen (U.band rising (Sat.ge s.sRst t.tReset)))
+    (Hw.mux (U.bor (U.band isMrs (U.bnot badMrs)) (U.band isZq (U.bnot badZq))) (Hw.mux initing (U.inc s.stage) s.stage) s.stage)
+    (Hw.or s.zqDone isZq)
+    (Hw.or s.err viol.1) (Hw.mux first viol.2 s.ecode) (Hw.mux first s.cycle s.at)
+    (Hw.mux isRef (U.inc s.refs) s.refs) (Hw.mux s.wv2 (U.inc s.writes) s.writes) (Hw.mux isRd (U.inc s.reads) s.reads)
+    addr isWr s.wa1 s.wv1 d.dqsOe
+    pipe (Hw.fst outNext) (Hw.snd outNext) s.outV s.outD
+    (Hw.mux d.dlyLd d.tap0 s.tap0) (Hw.mux d.dlyLd d.tap1 s.tap1);
+  Hw.pair (MSt.pack st) (Hw.pair (PhyIn.pack (PhyIn.mk (Model.raw mp s) U.hi))
+    (Viol.pack (Viol.mk s.err s.ecode s.at s.refs s.writes s.reads)))
+
+def Model.bank0 : HwTy.El Bank.code :=
+  Bundle.toEl Bank.bundle (Bank.mk (BitVec.ofNat 1 0) (BitVec.ofNat 14 0) (BitVec.ofNat 8 255) (BitVec.ofNat 8 255)
+    (BitVec.ofNat 8 255) (BitVec.ofNat 8 255))
+def Model.pipe0 : HwTy.El (HwTy.prod Bit (B 128)) := (BitVec.ofNat 1 0, BitVec.ofNat 128 0)
+def Model.init : HwTy.El MSt.code :=
+  Bundle.toEl MSt.bundle (MSt.mk (fun (a : BitVec 24) => BitVec.ofNat 128 0)
+    (Model.bank0, (Model.bank0, (Model.bank0, (Model.bank0, (Model.bank0, (Model.bank0, (Model.bank0, Model.bank0)))))))
+    (BitVec.ofNat 32 0) (BitVec.ofNat 16 65535) (BitVec.ofNat 8 255) (BitVec.ofNat 8 255) (BitVec.ofNat 8 255)
+    (BitVec.ofNat 8 255) (BitVec.ofNat 8 255) (BitVec.ofNat 16 0) (BitVec.ofNat 1 0) (BitVec.ofNat 16 0) (BitVec.ofNat 1 0)
+    (BitVec.ofNat 3 0) (BitVec.ofNat 1 0) (BitVec.ofNat 1 0) (BitVec.ofNat 8 0) (BitVec.ofNat 32 0)
+    (BitVec.ofNat 16 0) (BitVec.ofNat 16 0) (BitVec.ofNat 16 0)
+    (BitVec.ofNat 24 0) (BitVec.ofNat 1 0) (BitVec.ofNat 24 0) (BitVec.ofNat 1 0) (BitVec.ofNat 1 0)
+    (Model.pipe0, (Model.pipe0, (Model.pipe0, (Model.pipe0, (Model.pipe0, (Model.pipe0, (Model.pipe0, Model.pipe0)))))))
+    (BitVec.ofNat 1 0) (BitVec.ofNat 128 0) (BitVec.ofNat 1 0) (BitVec.ofNat 128 0) (BitVec.ofNat 5 0) (BitVec.ofNat 5 0))
+
+def Model.circuit (t : Timing) (mp : MParams) : Circuit Dfi.code (HwTy.prod PhyIn.code Viol.code) :=
+  Circuit.mk MSt.code Model.init (fun s d => Model.step t mp (MSt.unpack s) (Dfi.unpack d))

@@ -1,0 +1,7 @@
+import Grail
+-- `grail build`: check the library (the controller, its model) and compile the flow
+-- driver, `.grail/bin/ddr3` (app/ddr3.wiz). `grail test`: the simulation tests under tests/.
+def package : Package := Package.new "ddr3"
+  |> Package.lib "lib" "src"
+  |> Package.exe "ddr3" "app/ddr3.wiz"
+  |> Package.tests "tests" "tests"

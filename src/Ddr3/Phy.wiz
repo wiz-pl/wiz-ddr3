@@ -1,0 +1,103 @@
+import Hdl.Xilinx7
+import Ddr3.Ctrl
+-- The PHY on an Artix-7 (LiteDRAM's A7DDRPHY arrangement, /workspace/wiz-notes/ddr3-design.md
+-- §3): every DDR3 output but RESET# and CS# goes through an OSERDESE2 (8:1 DDR, CLK =
+-- sys4x, CLKDIV = the controller's clock); DQ comes back through IDELAYE2 and
+-- ISERDESE2; DQS is written only (sys4x at 90°), never read. RESET# and CS# come from
+-- fabric flip-flops through plain OBUFs: their pins (K6, U8) are in SING tiles, where
+-- prjxray has no OLOGIC CLKDIV bits.
+--
+-- Bits: an OSERDESE2's D1 (bit 0 of its byte) leaves first; a command is in phase 3 (D7,
+-- D8), NOP (all high) in phases 0..2; CK is 0xAA (low first: CK rises in the middle of a
+-- command bit). An ISERDESE2's Q8 is the earliest sample: `raw` bit j*8 + k is DQ j's
+-- sample k, k = 0 the earliest.
+
+-- n pins, each its own port `0` … `n-1`
+def Pads.t : Nat → Nat → HwTy
+  | k, .zero => HwTy.named (Hdl.show k) (HwTy.pad 1)
+  | k, .succ n => HwTy.prod (HwTy.named (Hdl.show k) (HwTy.pad 1)) (Pads.t (Nat.succ k) n)
+def Pads.io : Nat → Nat → HwTy
+  | k, .zero => HwTy.named (Hdl.show k) (HwTy.inout 1)
+  | k, .succ n => HwTy.prod (HwTy.named (Hdl.show k) (HwTy.inout 1)) (Pads.io (Nat.succ k) n)
+def Pads.of {r : HwTy → Type} [Hw r] (f : Nat → r (HwTy.pad 1)) : (ω k n : Nat) → r (Pads.t k n)
+  | k, .zero => Hw.tag (Hdl.show k) (f k)
+  | k, .succ n => Hw.pair (Hw.tag (Hdl.show k) (f k)) (Pads.of f (Nat.succ k) n)
+def Pads.ofIo {r : HwTy → Type} [Hw r] (f : Nat → r (HwTy.inout 1)) : (ω k n : Nat) → r (Pads.io k n)
+  | k, .zero => Hw.tag (Hdl.show k) (f k)
+  | k, .succ n => Hw.pair (Hw.tag (Hdl.show k) (f k)) (Pads.ofIo f (Nat.succ k) n)
+
+-- the DDR3 pins (port names `ddr3_a_0` …, as in the XDC of `Ddr3.Board`)
+structure Ddr3Pads (r : HwTy → Type) where
+  ddr3_ck_p : r (HwTy.pad 1)
+  ddr3_ck_n : r (HwTy.pad 1)
+  ddr3_reset_n : r (HwTy.pad 1)
+  ddr3_cs_n : r (HwTy.pad 1)
+  ddr3_cke : r (HwTy.pad 1)
+  ddr3_odt : r (HwTy.pad 1)
+  ddr3_ras_n : r (HwTy.pad 1)
+  ddr3_cas_n : r (HwTy.pad 1)
+  ddr3_we_n : r (HwTy.pad 1)
+  ddr3_ba : r (Pads.t 0 2)
+  ddr3_a : r (Pads.t 0 13)
+  ddr3_dm : r (Pads.t 0 1)
+  ddr3_dq : r (Pads.io 0 15)
+  ddr3_dqs_p0 : r (HwTy.inout 1)
+  ddr3_dqs_n0 : r (HwTy.inout 1)
+  ddr3_dqs_p1 : r (HwTy.inout 1)
+  ddr3_dqs_n1 : r (HwTy.inout 1)
+  deriving Bundle
+
+-- the PHY's clocks
+structure PhyClk (r : HwTy → Type) where
+  sys4x : r HwTy.clock
+  sys4xDqs : r HwTy.clock
+  ref200 : r HwTy.clock
+  deriving Bundle
+
+def Phy.ser {r : HwTy → Type} [Hw r] (fast : r HwTy.clock) (rst : r Bit) (d : r (B 8)) (t : r Bit) : r (HwTy.prod Bit Bit) :=
+  X7.oserdes fast Hw.clock rst d t
+def Phy.rep8 {r : HwTy → Type} [Hw r] (b : r Bit) : r (B 8) := U.ofBits (fun (k : Nat) => b) 8
+-- a command bit: high (NOP) in phases 0..2, `b` in phase 3
+def Phy.cmd8 {r : HwTy → Type} [Hw r] (b : r Bit) : r (B 8) := Hw.cat (Hw.cat b b) (Hw.lit 6 63)
+def Phy.out {r : HwTy → Type} [Hw r] (fast : r HwTy.clock) (rst : r Bit) (d : r (B 8)) : r (HwTy.pad 1) :=
+  X7.obuf (Hw.fst (Phy.ser fast rst d U.lo))
+
+-- DQ j: written from the burst, read back through the IDELAY of its lane: its pad and
+-- its raw word
+def Phy.dq {r : HwTy → Type} [Hw r] (c : PhyClk r) (rst : r Bit) (d : Dfi r) (j : Nat) : r (HwTy.prod (HwTy.inout 1) (B 8)) :=
+  let ser := Phy.ser c.sys4x rst (U.ofBits (fun (b : Nat) => U.bit d.wrdata (b * 16 + j)) 8) (U.bnot d.dqOe);
+  let io := X7.iobufT (Hw.fst ser) (Hw.snd ser);
+  let tap := match Nat.lt j 8 with
+    | .true => d.tap0
+    | .false => d.tap1;
+  let dly := X7.idelay U.lo U.lo d.dlyLd tap (Hw.fst io);
+  let q := X7.iserdes c.sys4x Hw.clock rst (Hw.fst dly);
+  Hw.pair (Hw.snd io) (U.ofBits (fun (k : Nat) => U.bit q (7 - k)) 8)
+
+-- the raw words of all DQs, from their pieces
+def Phy.raw {r : HwTy → Type} [Hw r] (qs : Nat → r (B 8)) : r (B 128) :=
+  U.ofBits (fun (p : Nat) => U.bit (qs (Nat.div p 8)) (Nat.mod p 8)) 128
+
+-- DQS l: 01010101 (D1 first) while writing, low in the pre- and postamble cycles
+def Phy.dqs {r : HwTy → Type} [Hw r] (c : PhyClk r) (rst : r Bit) (d : Dfi r) : r (HwTy.prod Bit (HwTy.prod (HwTy.inout 1) (HwTy.inout 1))) :=
+  let ser := Phy.ser c.sys4xDqs rst (Hw.mux d.dqsOn (Hw.lit 8 85) (Hw.lit 8 0)) (U.bnot d.dqsOe);
+  X7.iobufdsT (Hw.fst ser) (Hw.snd ser)
+
+-- The PHY: the pads, and what comes back (`raw` before its register; `rdy`, the
+-- IDELAYCTRL's). `rst` resets the SERDES (high for some cycles once the clocks run).
+def Phy.io {r : HwTy → Type} [Hw r] (c : PhyClk r) (rst : r Bit) (rstN : r Bit) (d : Dfi r) : r (HwTy.prod Ddr3Pads.code PhyIn.code) :=
+  let ck := X7.obufds (Hw.fst (Phy.ser c.sys4x rst (Hw.lit 8 170) U.lo));
+  -- (one value for all sixteen, so that each DQ's cells are built once)
+  let dqAll := V.ofN 15 (fun (j : Nat) => Phy.dq c rst d j);
+  let dqs0 := Phy.dqs c rst d;
+  let dqs1 := Phy.dqs c rst d;
+  let rdy := X7.idelayctrl c.ref200 rst;
+  let pads := Ddr3Pads.mk (Hw.fst ck) (Hw.snd ck) (X7.obuf rstN) (X7.obuf U.lo)
+    (Phy.out c.sys4x rst (Phy.rep8 d.cke)) (Phy.out c.sys4x rst (Phy.rep8 d.odt))
+    (Phy.out c.sys4x rst (Phy.cmd8 d.ras_n)) (Phy.out c.sys4x rst (Phy.cmd8 d.cas_n)) (Phy.out c.sys4x rst (Phy.cmd8 d.we_n))
+    (Pads.of (fun (k : Nat) => Phy.out c.sys4x rst (Phy.rep8 (U.bit d.ba k))) 0 2)
+    (Pads.of (fun (k : Nat) => Phy.out c.sys4x rst (Phy.rep8 (U.bit d.a k))) 0 13)
+    (Pads.of (fun (l : Nat) => Phy.out c.sys4x rst (U.ofBits (fun (b : Nat) => U.bit d.wrdm (b * 2 + l)) 8)) 0 1)
+    (Pads.ofIo (fun (j : Nat) => Hw.fst (V.getN 15 dqAll j)) 0 15)
+    (Hw.fst (Hw.snd dqs0)) (Hw.snd (Hw.snd dqs0)) (Hw.fst (Hw.snd dqs1)) (Hw.snd (Hw.snd dqs1));
+  Hw.pair (Ddr3Pads.pack pads) (PhyIn.pack (PhyIn.mk (Phy.raw (fun (j : Nat) => Hw.snd (V.getN 15 dqAll j))) rdy))

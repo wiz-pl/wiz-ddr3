@@ -1,0 +1,159 @@
+import Ddr3.Phy
+-- The board design: the controller and the PHY, a memory test over the native port,
+-- and a report over the UART (115200 baud 8N1: 866 cycles per bit at 100 MHz, a little
+-- fast of the FT2232's 3 MHz / 26, see wiz-arty's README).
+--
+-- After calibration it prints
+--   DDR3 cal done=1 fail=0 tap0=0F slip0=3 tap1=12 slip1=3 lat=07
+--   M0 <64 hex digits: lane 0's good (slip, tap) map, bit s*32 + t, highest first>
+--   M1 <… lane 1's>
+-- then runs three passes over 2^`ab` bursts (2^24 = all 256 MB), forever:
+--   P0 walking ones (burst a: bit a mod 128 set), P1 address in address (each 32-bit word
+--   is the burst address), P2 random (an LFSR, re-seeded for the read-back)
+-- each a write of every burst, then a read and compare of every burst, and after each
+--   P0 err=00000000 cyc=0A3F2C11 first=000000 got=00000000 exp=00000000
+-- (errors, cycles of the pass, the first bad burst and the low words read and expected).
+-- 16 bytes per burst: the pass's bandwidth is 2 · 2^ab · 16 bytes / (cyc · 10 ns).
+-- LEDs: LD4 calibrated, LD5 calibration failed, LD6 an error seen, LD7 the pass count's
+-- low bit.
+
+structure Tx (r : HwTy → Type) where
+  line : r Bit
+  left : r (B 4)
+  cnt : r (B 10)
+  sh : r (B 9)
+  deriving Bundle
+
+def Tx.idle {r : HwTy → Type} [Hw r] (s : Tx r) : r Bit := U.isZero s.left
+-- an 8N1 transmitter, `n` cycles per bit (as wiz-arty's Arty.Uart)
+def Tx.step {r : HwTy → Type} [Hw r] (n : Nat) (s : Tx r) (start : r Bit) (d : r (B 8)) : r Tx.code :=
+  let idle := Tx.idle s;
+  let go := U.band idle start;
+  let tick := U.band (U.bnot idle) (U.isLit s.cnt (n - 1));
+  Tx.pack (Tx.mk (Hw.mux go U.lo (Hw.mux tick (U.bit s.sh 0) s.line))
+    (Hw.mux go (Hw.lit 4 10) (Hw.mux tick (U.dec s.left) s.left))
+    (Hw.mux (U.bor go tick) (Hw.lit 10 0) (U.inc s.cnt))
+    (Hw.mux go (Hw.cat U.hi d) (Hw.mux tick (Hw.cat U.hi (Hw.slice 1 8 s.sh)) s.sh)))
+
+------------------------------------------------------------------------------------
+-- Messages: a list of bytes (signals), sent one per character time.
+
+def Pr.str {r : HwTy → Type} [Hw r] (s : String) : List (r (B 8)) :=
+  Hdl.map (fun (c : Char) => Hw.lit 8 (Char.code c)) (String.chars s)
+def Pr.hexDigit {r : HwTy → Type} [Hw r] (x : r (B 4)) : r (B 8) :=
+  Hw.mux (Hw.ult x (Hw.lit 4 10)) (Hw.add (Hw.cat (Hw.lit 4 0) x) (Hw.lit 8 48)) (Hw.add (Hw.cat (Hw.lit 4 0) x) (Hw.lit 8 55))
+-- `k` hex digits of `x`, the highest first
+def Pr.hexFrom {r : HwTy → Type} [Hw r] {ω w : Nat} (x : r (B w)) : (ω k : Nat) → List (r (B 8))
+  | .zero => .nil
+  | .succ k => .cons (Pr.hexDigit (Hw.slice (k * 4) 4 x)) (Pr.hexFrom x k)
+def Pr.hex {r : HwTy → Type} [Hw r] {ω w : Nat} (x : r (B w)) (k : Nat) : List (r (B 8)) := Pr.hexFrom x k
+def Pr.crlf {r : HwTy → Type} [Hw r] : List (r (B 8)) := .cons (Hw.lit 8 13) (.cons (Hw.lit 8 10) .nil)
+def Pr.byteAt {r : HwTy → Type} [Hw r] (items : List (r (B 8))) (pos : r (B 9)) : r (B 8) :=
+  U.select pos (fun (k : Nat) => Hdl.nthD (Hw.lit 8 0) items k) (List.length items)
+
+structure MtSt (r : HwTy → Type) where
+  ctrl : r St.code
+  phy : r PhyIn.code
+  rstCnt : r (B 8)
+  mode : r (B 3)        -- 0 wait for calibration, 1 report it, 2 a pass, 3 report the pass
+  pass : r (B 2)
+  reading : r Bit
+  addr : r (B 25)       -- the next burst to issue
+  waiting : r Bit       -- a read is out
+  raddr : r (B 24)      -- its burst
+  rexp : r (B 128)      -- and what it should return
+  lfsr : r (B 32)
+  errs : r (B 32)
+  cycles : r (B 32)
+  firstA : r (B 24)
+  firstG : r (B 32)
+  firstE : r (B 32)
+  passes : r (B 8)
+  pos : r (B 9)
+  tx : r Tx.code
+  deriving Bundle
+
+structure MtIn (r : HwTy → Type) where
+  sys4x : r HwTy.clock
+  sys4xDqs : r HwTy.clock
+  ref200 : r HwTy.clock
+  locked : r Bit
+  uart_rx : r Bit
+  deriving Bundle
+structure Board (r : HwTy → Type) where
+  uart_tx : r Bit
+  led : r (B 4)
+  deriving Bundle
+
+def Mt.seed : Nat := 2463534242
+-- a pass's data for burst a
+def Mt.data {r : HwTy → Type} [Hw r] (pass : r (B 2)) (a : r (B 24)) (lfsr : r (B 32)) : r (B 128) :=
+  let a32 := Hw.cat (Hw.lit 8 0) a;
+  let walk := U.ofBits (fun (k : Nat) => U.isLit (Hw.slice 0 7 a) k) 128;
+  Hw.mux (U.isLit pass 0) walk (Hw.mux (U.isLit pass 1) (Hw.cat (Hw.cat a32 a32) (Hw.cat a32 a32)) (Rnd.data lfsr))
+
+-- the step, `ab` the bursts' address bits (24 on the board), `n` cycles per UART bit
+def Mt.step {r : HwTy → Type} [Hw r] (t : Timing) (ab n : Nat) (s : MtSt r) (x : MtIn r) :
+    r (HwTy.prod MtSt.code (HwTy.prod Ddr3Pads.code Board.code)) :=
+  let cs := St.unpack s.ctrl;
+  let phyRst := U.bnot (U.isLit s.rstCnt 255);
+  let testing := U.isLit s.mode 2;
+  let last := Hw.eq s.addr (Hw.lit 25 (Nat.pow 2 ab));
+  let a24 := Hw.slice 0 24 s.addr;
+  let wdata := Mt.data s.pass a24 s.lfsr;
+  let req := PortIn.mk (U.band testing (U.band (U.bnot last) (U.bnot s.waiting))) (U.bnot s.reading) a24 wdata (Hw.lit 16 65535);
+  let co := Ctrl.step t cs req (PhyIn.unpack s.phy);
+  let po := PortOut.unpack (Hw.fst (Hw.snd co));
+  let dfi := Dfi.unpack (Hw.snd (Hw.snd co));
+  let phy := Phy.io (PhyClk.mk x.sys4x x.sys4xDqs x.ref200) phyRst cs.rstN dfi;
+  let accept := U.band req.valid po.ready;
+  let back := U.band s.waiting po.rvalid;
+  let bad := U.band back (U.bnot (Hw.eq po.rdata s.rexp));
+  -- a pass ends when every burst was issued and nothing is out
+  let passEnd := U.band testing (U.band last (U.bnot s.waiting));
+  let writesEnd := U.band passEnd (U.bnot s.reading);
+  let readsEnd := U.band passEnd s.reading;
+  let txs := Tx.unpack s.tx;
+  let calMsg := List.append (Pr.str "DDR3 cal done=") (List.append (Pr.hex po.calDone 1)
+    (List.append (Pr.str " fail=") (List.append (Pr.hex po.calFail 1)
+    (List.append (Pr.str " tap0=") (List.append (Pr.hex po.tap0 2) (List.append (Pr.str " slip0=") (List.append (Pr.hex po.slip0 1)
+    (List.append (Pr.str " tap1=") (List.append (Pr.hex po.tap1 2) (List.append (Pr.str " slip1=") (List.append (Pr.hex po.slip1 1)
+    (List.append (Pr.str " lat=") (List.append (Pr.hex po.lat 2) (List.append Pr.crlf
+    (List.append (Pr.str "M0 ") (List.append (Pr.hex po.map0 64) (List.append Pr.crlf
+    (List.append (Pr.str "M1 ") (List.append (Pr.hex po.map1 64) Pr.crlf)))))))))))))))))));
+  let passMsg := List.append (Pr.str "P") (List.append (Pr.hex s.pass 1) (List.append (Pr.str " err=") (List.append (Pr.hex s.errs 8)
+    (List.append (Pr.str " cyc=") (List.append (Pr.hex s.cycles 8) (List.append (Pr.str " first=") (List.append (Pr.hex s.firstA 6)
+    (List.append (Pr.str " got=") (List.append (Pr.hex s.firstG 8) (List.append (Pr.str " exp=") (List.append (Pr.hex s.firstE 8) Pr.crlf)))))))))));
+  let printing := U.bor (U.isLit s.mode 1) (U.isLit s.mode 3);
+  let msgLen := Hw.mux (U.isLit s.mode 1) (Hw.lit 9 (List.length calMsg)) (Hw.lit 9 (List.length passMsg));
+  let more := Hw.ult s.pos msgLen;
+  let send := U.band printing (U.band more (Tx.idle txs));
+  let byte := Hw.mux (U.isLit s.mode 1) (Pr.byteAt calMsg s.pos) (Pr.byteAt passMsg s.pos);
+  let printed := U.band printing (U.band (U.bnot more) (Tx.idle txs));
+  let mode := Hw.mux (U.band (U.isZero s.mode) cs.calDone) (Hw.lit 3 1)
+    (Hw.mux printed (Hw.lit 3 2) (Hw.mux readsEnd (Hw.lit 3 3) s.mode));
+  let nextPass := Hw.mux (U.isLit s.pass 2) (Hw.lit 2 0) (U.inc s.pass);
+  let passStart := U.band printed (U.isLit s.mode 3);
+  let st := MtSt.mk (Hw.fst co) (Hw.snd phy) (Hw.mux phyRst (Hw.mux x.locked (U.inc s.rstCnt) s.rstCnt) s.rstCnt) mode
+    (Hw.mux passStart nextPass s.pass)
+    (Hw.mux writesEnd U.hi (Hw.mux readsEnd U.lo s.reading))
+    (Hw.mux passEnd (Hw.lit 25 0) (Hw.mux accept (U.inc s.addr) s.addr))
+    (Hw.mux (U.band accept s.reading) U.hi (Hw.mux back U.lo s.waiting))
+    (Hw.mux accept a24 s.raddr) (Hw.mux accept wdata s.rexp)
+    (Hw.mux (U.bor passEnd passStart) (Hw.lit 32 Mt.seed) (Hw.mux accept (Rnd.next s.lfsr) s.lfsr))
+    (Hw.mux passStart (Hw.lit 32 0) (Hw.mux bad (U.inc s.errs) s.errs))
+    (Hw.mux passStart (Hw.lit 32 0) (Hw.mux testing (U.inc s.cycles) s.cycles))
+    (Hw.mux (U.band bad (U.isZero s.errs)) s.raddr s.firstA)
+    (Hw.mux (U.band bad (U.isZero s.errs)) (Hw.slice 0 32 po.rdata) s.firstG)
+    (Hw.mux (U.band bad (U.isZero s.errs)) (Hw.slice 0 32 s.rexp) s.firstE)
+    (Hw.mux readsEnd (U.inc s.passes) s.passes)
+    (Hw.mux send (U.inc s.pos) (Hw.mux printed (Hw.lit 9 0) s.pos))
+    (Tx.step n txs send byte);
+  Hw.pair (MtSt.pack st) (Hw.pair (Hw.fst phy)
+    (Board.pack (Board.mk txs.line (Hw.cat (Hw.cat (U.bit s.passes 0) (U.bor (U.bnot (U.isZero s.errs)) U.lo)) (Hw.cat po.calFail po.calDone)))))
+
+def Mt.z (n : Nat) : HwTy.El (B n) := BitVec.ofNat n 0
+def Mt.init (t : Timing) : HwTy.El MtSt.code :=
+  Bundle.toEl MtSt.bundle (MtSt.mk (Ctrl.init t) (Mt.z 128, Mt.z 1) (Mt.z 8) (Mt.z 3) (Mt.z 2) (Mt.z 1) (Mt.z 25)
+    (Mt.z 1) (Mt.z 24) (Mt.z 128) (BitVec.ofNat 32 Mt.seed) (Mt.z 32) (Mt.z 32) (Mt.z 24) (Mt.z 32) (Mt.z 32)
+    (Mt.z 8) (Mt.z 9) (Bundle.toEl Tx.bundle (Tx.mk (BitVec.ofNat 1 1) (Mt.z 4) (Mt.z 10) (BitVec.ofNat 9 511))))
