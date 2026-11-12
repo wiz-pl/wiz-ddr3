@@ -24,10 +24,28 @@ def U.ofBitsFrom {r : HwTy → Type} [Hw r] (f : Nat → r Bit) : (ω k n : Nat)
   | k, .succ n => Hw.slice 0 (Nat.succ n) (Hw.cat (U.ofBitsFrom f (Nat.succ k) n) (f k))
 def U.ofBits {r : HwTy → Type} [Hw r] (f : Nat → r Bit) (n : Nat) : r (B n) := U.ofBitsFrom f 0 n
 
--- `f k` where `sel = k`, for k < n; `f 0` otherwise
-def U.select {r : HwTy → Type} [Hw r] {ω w : Nat} {ω t : HwTy} (sel : r (B w)) (f : Nat → r t) : (ω n : Nat) → r t
-  | .zero => f 0
-  | .succ n => Hw.mux (U.isLit sel n) (f n) (U.select sel f n)
+-- `f k` where `sel = k`, for k < n; `f 0` otherwise. A balanced tree of multiplexers on
+-- the bits of `sel` (depth log n, not n: a chain of 256 failed timing at 22 MHz).
+def U.clog2Aux : Nat → Nat → Nat → Nat
+  | .zero, _, k => k
+  | .succ fuel, n, k => match Nat.le n (Nat.pow 2 k) with
+    | .true => k
+    | .false => U.clog2Aux fuel n (Nat.succ k)
+def U.clog2 (n : Nat) : Nat := U.clog2Aux 64 n 0
+def U.selTree {r : HwTy → Type} [Hw r] {ω w : Nat} {ω t : HwTy} (sel : r (B w)) (f : Nat → r t) (n : Nat) : (ω k base : Nat) → r t
+  | .zero, base => match Nat.lt base n with
+    | .true => f base
+    | .false => f 0
+  | .succ k, base => match Nat.lt (base + Nat.pow 2 k) n with
+    | .true => Hw.mux (U.bit sel k) (U.selTree sel f n k (base + Nat.pow 2 k)) (U.selTree sel f n k base)
+    | .false => U.selTree sel f n k base
+def U.select {r : HwTy → Type} [Hw r] {ω w : Nat} {ω t : HwTy} (sel : r (B w)) (f : Nat → r t) (n : Nat) : r t :=
+  let ω k := U.clog2 n;
+  match Nat.lt k w with
+  | .true => Hw.mux (Hw.ult sel (Hw.lit w n)) (U.selTree sel f n k 0) (f 0)
+  | .false => match Nat.lt n (Nat.pow 2 w) with
+    | .true => Hw.mux (Hw.ult sel (Hw.lit w n)) (U.selTree sel f n w 0) (f 0)
+    | .false => U.selTree sel f n w 0
 
 -- `x` with the bit at index `sel` (a signal) set to `b`, for a bus of `n` bits
 def U.setBit {r : HwTy → Type} [Hw r] {ω w : Nat} (n : Nat) (x : r (B n)) (sel : r (B w)) (b : r Bit) : r (B n) :=

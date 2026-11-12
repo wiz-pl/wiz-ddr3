@@ -70,3 +70,22 @@ Recorded as the work goes (agent ddr3, from 2026-11-12). Design notes:
 * Workaround: `let ω b := …`, or no `let` (proofs/SchedProof.wiz projects `(SP.base).f`).
 * Also: `SP.base.phase` (a field of a namespaced constant, written with dots) is "unknown
   identifier 'SP'"; `(SP.base).phase` works.
+
+## Status (2026-11-12, stopped by the user: quota)
+
+* D0 done (/workspace/wiz-notes/ddr3-design.md). D1 done: PR #240 (agent/hdl-prim), with
+  a later fix: X7.iserdes let-binds its instance (it was built 8 times per DQ, which
+  nextpnr rejected: two ISERDESE2 on one bel).
+* D2 and D3a pass in compiled simulation (`.grail/bin/ddr3 sim`, `csim`). The controller
+  against the behavioural model: 30000 cycles, 2576 ops, 0 mismatches, 38 refreshes, no
+  JEDEC violation. Device variants calibrate as expected. The D5 write-back cache: 1135
+  ops, 0 mismatches.
+* D4 build: `ddr3 bit` synthesises and places (43 OSERDESE2, 16 ISERDESE2/IDELAYE2,
+  IDELAYCTRL, PLL wrapper) but **fails timing: 22.5 MHz against 100 MHz**. The critical
+  path is a linear chain of multiplexers from `U.select` (256-way map lookup, the UART
+  message ROMs). The last commit makes `U.select` a balanced tree (log depth). That is
+  **not yet simulated or rebuilt**: rerun `ddr3 sim 30000` and `ddr3 bit` first. Not
+  loaded on the board (no board slot requested).
+* D3b (proofs/SchedProof.wiz): the machine, monitor, BFS and soundness lemmas are
+  written; the kernel check was still running when work stopped. D3c (`ddr3 vsim`, Icarus
+  + Micron + unisims) is written but has not been run.

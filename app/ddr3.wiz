@@ -114,6 +114,18 @@ def mpOf : List String → MParams
 
 def design : Netlist := Circuit.netlist "memtest" (Board.memtestC Timing.arty 24 866)
 
+-- primitive instances by module name
+def bump (k : String) : List (String × Nat) → List (String × Nat)
+  | .nil => .cons (k, 1) .nil
+  | .cons p ps => match String.eq p.1 k with
+    | .true => .cons (p.1, Nat.succ p.2) ps
+    | .false => .cons p (bump k ps)
+def cellCounts : List NetNode → List (String × Nat) → List (String × Nat)
+  | .nil, acc => acc
+  | .cons n ns, acc => cellCounts ns (match n.op with
+    | .inst p => bump p.name acc
+    | _ => acc)
+
 def gen : EIO Unit := do
   ensureDir "build";
   let n := design;
@@ -121,6 +133,7 @@ def gen : EIO Unit := do
   (match n.errors with
     | .nil => EIO.pure ()
     | es => EIO.fail ("netlist errors: " <+> unwords es));
+  say ("  cells: " <+> unwords (Hdl.map (fun (p : String × Nat) => p.1 <+> "×" <+> Hdl.show p.2) (cellCounts n.nodes .nil)));
   FS.writeFile (build "memtest.v") (Verilog.emitTop n Board.clocking);
   FS.writeFile (build "memtest.xdc") Board.xdc
 

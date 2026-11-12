@@ -26,12 +26,12 @@ def SP.ageCap : Nat := 40
 def SP.ageMax : Nat := 18
 
 -- the scheduler's control state, as numbers: sst, stimer, swe, refPend
-structure SP.Sc where
+structure SPSc where
   sst : Nat
   stimer : Nat
   swe : Nat
   refPend : Nat
-structure SP.Mon where
+structure SPMon where
   sAct : Nat
   sPre : Nat
   sRw : Nat
@@ -39,20 +39,20 @@ structure SP.Mon where
   sRef : Nat
   open : Bool
   age : Nat
-structure SP.S where
-  sc : SP.Sc
-  mon : SP.Mon
+structure SPS where
+  sc : SPSc
+  mon : SPMon
 -- the inputs: a refresh falls due, a request, it is a write
-structure SP.I where
+structure SPI where
   refDue : Bool
   valid : Bool
   we : Bool
 
 def SP.base : St HwTy.El := Bundle.ofEl St.bundle (Ctrl.init SP.t)
-def SP.st (c : SP.Sc) : St HwTy.El :=
+def SP.st (c : SPSc) : St HwTy.El :=
   St.mk (SP.base).phase (SP.base).timer (SP.base).step (SP.base).rstN (SP.base).cke (SP.base).ras (SP.base).cas (SP.base).wen (SP.base).ba (SP.base).a (BitVec.ofNat 2 c.sst) (BitVec.ofNat 8 c.stimer) (BitVec.ofNat 1 c.swe) (SP.base).sba (SP.base).srow (SP.base).scol (SP.base).wdata (SP.base).wdm (SP.base).refCnt (BitVec.ofNat 1 c.refPend) (SP.base).wrHist (SP.base).rdHist (SP.base).prevRaw (SP.base).prevAl0 (SP.base).prevAl1 (SP.base).cst (SP.base).ctap (SP.base).cwin (SP.base).hits0 (SP.base).hits1 (SP.base).lat0 (SP.base).lat1 (SP.base).map0 (SP.base).map1 (SP.base).cpos (SP.base).run0s (SP.base).run0l (SP.base).run1s (SP.base).run1l (SP.base).best0s (SP.base).best0l (SP.base).best0p (SP.base).best1s (SP.base).best1l (SP.base).best1p (SP.base).slip0 (SP.base).slip1 (SP.base).tap0 (SP.base).tap1 (SP.base).latR (SP.base).dly0 (SP.base).dly1 (SP.base).calDone (SP.base).calFail (SP.base).dlyLd
 def SP.bit (b : Bool) : HwTy.El Bit := Bool.toBits b
-def SP.req (x : SP.I) : Req HwTy.El :=
+def SP.req (x : SPI) : Req HwTy.El :=
   Req.mk (SP.bit x.valid) (SP.bit x.we) (BitVec.ofNat 24 0) (BitVec.ofNat 128 0) (BitVec.ofNat 16 0)
 
 -- commands: 0 NOP, 1 ACT, 2 RD, 3 WR, 4 PRE, 5 REF, 6 other
@@ -75,7 +75,7 @@ def SP.since (now : Bool) (k : Nat) : Nat := match now with
 def SP.ge (k m : Nat) : Bool := Bool.not (Nat.lt k m)
 
 -- does command `c` break a rule, given the monitor
-def SP.bad (m : SP.Mon) (c : Nat) : Bool :=
+def SP.bad (m : SPMon) (c : Nat) : Bool :=
   let t := SP.t;
   let isAct := Nat.beq c 1;
   let isRw := Bool.or (Nat.beq c 2) (Nat.beq c 3);
@@ -83,18 +83,18 @@ def SP.bad (m : SP.Mon) (c : Nat) : Bool :=
   let isRef := Nat.beq c 5;
   let any := Bool.not (Nat.beq c 0);
   Bool.or (Nat.beq c 6)
-  (Bool.or (Bool.and any (Bool.not (SP.ge m.sRef t.tRFC)))
-  (Bool.or (Bool.and isAct (Bool.or m.open (Bool.or (Bool.not (SP.ge m.sPre t.tRP)) (Bool.not (SP.ge m.sAct t.tRC)))))
-  (Bool.or (Bool.and isRw (Bool.or (Bool.not m.open) (Bool.not (SP.ge m.sAct t.tRCD))))
-  (Bool.or (Bool.and isPre (Bool.or (Bool.not (SP.ge m.sAct t.tRAS))
+    (Bool.or (Bool.and any (Bool.not (SP.ge m.sRef t.tRFC)))
+    (Bool.or (Bool.and isAct (Bool.or m.open (Bool.or (Bool.not (SP.ge m.sPre t.tRP)) (Bool.not (SP.ge m.sAct t.tRC)))))
+    (Bool.or (Bool.and isRw (Bool.or (Bool.not m.open) (Bool.not (SP.ge m.sAct t.tRCD))))
+    (Bool.or (Bool.and isPre (Bool.or (Bool.not (SP.ge m.sAct t.tRAS))
       (match m.wasWr with
         | .true => Bool.not (SP.ge m.sRw t.tWRP)
         | .false => Bool.not (SP.ge m.sRw t.tRTP))))
-  (Bool.and isRef (Bool.or m.open (Bool.not (SP.ge m.sPre t.tRP))))))))
+    (Bool.and isRef (Bool.or m.open (Bool.not (SP.ge m.sPre t.tRP))))))))
 
-def SP.monNext (m : SP.Mon) (c : Nat) (pendNext : Bool) : SP.Mon :=
+def SP.monNext (m : SPMon) (c : Nat) (pendNext : Bool) : SPMon :=
   let isRw := Bool.or (Nat.beq c 2) (Nat.beq c 3);
-  SP.Mon.mk (SP.since (Nat.beq c 1) m.sAct) (SP.since (Nat.beq c 4) m.sPre) (SP.since isRw m.sRw)
+  SPMon.mk (SP.since (Nat.beq c 1) m.sAct) (SP.since (Nat.beq c 4) m.sPre) (SP.since isRw m.sRw)
     (match isRw with
       | .true => Nat.beq c 3
       | .false => m.wasWr)
@@ -111,17 +111,17 @@ def SP.monNext (m : SP.Mon) (c : Nat) (pendNext : Bool) : SP.Mon :=
         | .false => SP.ageCap))
 
 -- one step: the scheduler (on), then the monitor on the command it presents next
-def SP.step (s : SP.S) (x : SP.I) : SP.S × Bool :=
+def SP.step (s : SPS) (x : SPI) : SPS × Bool :=
   let sn := Sched.step SP.t (SP.st s.sc) (SP.bit .true) (SP.bit x.refDue) (SP.req x);
   let c := SP.kind (BitVec.toNat sn.cmd.ras) (BitVec.toNat sn.cmd.cas) (BitVec.toNat sn.cmd.wen);
   let pend := Nat.beq (BitVec.toNat sn.refPend) 1;
   let m := SP.monNext s.mon c pend;
-  (SP.S.mk (SP.Sc.mk (BitVec.toNat sn.sst) (BitVec.toNat sn.stimer) (BitVec.toNat sn.swe) (BitVec.toNat sn.refPend)) m,
+  (SPS.mk (SPSc.mk (BitVec.toNat sn.sst) (BitVec.toNat sn.stimer) (BitVec.toNat sn.swe) (BitVec.toNat sn.refPend)) m,
     Bool.or (SP.bad s.mon c) (Nat.lt SP.ageMax m.age))
-def SP.M : Mealy SP.S SP.I Bool := SP.step
+def SP.M : Mealy SPS SPI Bool := SP.step
 
-def SP.init : SP.S :=
-  SP.S.mk (SP.Sc.mk 0 0 0 0) (SP.Mon.mk SP.cap SP.cap SP.cap .false SP.cap .false 0)
+def SP.init : SPS :=
+  SPS.mk (SPSc.mk 0 0 0 0) (SPMon.mk SP.cap SP.cap SP.cap .false SP.cap .false 0)
 
 ------------------------------------------------------------------------------------
 -- Equality of states, decided, and sound
@@ -147,101 +147,98 @@ def SP.and_r : (a b : Bool) → Bool.and a b = .true → b = .true
   | .true, _, e => e
   | .false, _, e => absurd e.1
 
-def SP.Sc.eqB (a b : SP.Sc) : Bool :=
+def SPSc.eqB (a b : SPSc) : Bool :=
   Bool.and (Nat.beq a.sst b.sst) (Bool.and (Nat.beq a.stimer b.stimer) (Bool.and (Nat.beq a.swe b.swe) (Nat.beq a.refPend b.refPend)))
-def SP.Sc.eqB_sound : (a b : SP.Sc) → SP.Sc.eqB a b = .true → a = b
-  | .mk a1 a2 a3 a4, .mk b1 b2 b3 b4, e =>
-    let e1 := SP.nEq_sound a1 b1 (SP.and_l _ _ e);
-    let r1 := SP.and_r _ _ e;
-    let e2 := SP.nEq_sound a2 b2 (SP.and_l _ _ r1);
-    let r2 := SP.and_r _ _ r1;
-    let e3 := SP.nEq_sound a3 b3 (SP.and_l _ _ r2);
-    let e4 := SP.nEq_sound a4 b4 (SP.and_r _ _ r2);
-    Eq.trans (Eq.congrArg (fun (x : Nat) => SP.Sc.mk x a2 a3 a4) e1)
-      (Eq.trans (Eq.congrArg (fun (x : Nat) => SP.Sc.mk b1 x a3 a4) e2)
-        (Eq.trans (Eq.congrArg (fun (x : Nat) => SP.Sc.mk b1 b2 x a4) e3)
-          (Eq.congrArg (fun (x : Nat) => SP.Sc.mk b1 b2 b3 x) e4)))
+def SPSc.eqB_sound (a b : SPSc) (e : SPSc.eqB a b = .true) : a = b :=
+  let e1 := SP.nEq_sound a.sst b.sst (SP.and_l _ _ e);
+  let r1 := SP.and_r _ _ e;
+  let e2 := SP.nEq_sound a.stimer b.stimer (SP.and_l _ _ r1);
+  let r2 := SP.and_r _ _ r1;
+  let e3 := SP.nEq_sound a.swe b.swe (SP.and_l _ _ r2);
+  let e4 := SP.nEq_sound a.refPend b.refPend (SP.and_r _ _ r2);
+  Eq.trans (Eq.congrArg (fun (x : Nat) => SPSc.mk x a.stimer a.swe a.refPend) e1)
+    (Eq.trans (Eq.congrArg (fun (x : Nat) => SPSc.mk b.sst x a.swe a.refPend) e2)
+      (Eq.trans (Eq.congrArg (fun (x : Nat) => SPSc.mk b.sst b.stimer x a.refPend) e3)
+        (Eq.congrArg (fun (x : Nat) => SPSc.mk b.sst b.stimer b.swe x) e4)))
 
-def SP.Mon.eqB (a b : SP.Mon) : Bool :=
+def SPMon.eqB (a b : SPMon) : Bool :=
   Bool.and (Nat.beq a.sAct b.sAct) (Bool.and (Nat.beq a.sPre b.sPre) (Bool.and (Nat.beq a.sRw b.sRw)
     (Bool.and (SP.bEq a.wasWr b.wasWr) (Bool.and (Nat.beq a.sRef b.sRef) (Bool.and (SP.bEq a.open b.open) (Nat.beq a.age b.age))))))
-def SP.Mon.eqB_sound : (a b : SP.Mon) → SP.Mon.eqB a b = .true → a = b
-  | .mk a1 a2 a3 a4 a5 a6 a7, .mk b1 b2 b3 b4 b5 b6 b7, e =>
-    let e1 := SP.nEq_sound a1 b1 (SP.and_l _ _ e);
-    let r1 := SP.and_r _ _ e;
-    let e2 := SP.nEq_sound a2 b2 (SP.and_l _ _ r1);
-    let r2 := SP.and_r _ _ r1;
-    let e3 := SP.nEq_sound a3 b3 (SP.and_l _ _ r2);
-    let r3 := SP.and_r _ _ r2;
-    let e4 := SP.bEq_sound a4 b4 (SP.and_l _ _ r3);
-    let r4 := SP.and_r _ _ r3;
-    let e5 := SP.nEq_sound a5 b5 (SP.and_l _ _ r4);
-    let r5 := SP.and_r _ _ r4;
-    let e6 := SP.bEq_sound a6 b6 (SP.and_l _ _ r5);
-    let e7 := SP.nEq_sound a7 b7 (SP.and_r _ _ r5);
-    Eq.trans (Eq.congrArg (fun (x : Nat) => SP.Mon.mk x a2 a3 a4 a5 a6 a7) e1)
-    (Eq.trans (Eq.congrArg (fun (x : Nat) => SP.Mon.mk b1 x a3 a4 a5 a6 a7) e2)
-    (Eq.trans (Eq.congrArg (fun (x : Nat) => SP.Mon.mk b1 b2 x a4 a5 a6 a7) e3)
-    (Eq.trans (Eq.congrArg (fun (x : Bool) => SP.Mon.mk b1 b2 b3 x a5 a6 a7) e4)
-    (Eq.trans (Eq.congrArg (fun (x : Nat) => SP.Mon.mk b1 b2 b3 b4 x a6 a7) e5)
-    (Eq.trans (Eq.congrArg (fun (x : Bool) => SP.Mon.mk b1 b2 b3 b4 b5 x a7) e6)
-      (Eq.congrArg (fun (x : Nat) => SP.Mon.mk b1 b2 b3 b4 b5 b6 x) e7))))))
+def SPMon.eqB_sound (a b : SPMon) (e : SPMon.eqB a b = .true) : a = b :=
+  let e1 := SP.nEq_sound a.sAct b.sAct (SP.and_l _ _ e);
+  let r1 := SP.and_r _ _ e;
+  let e2 := SP.nEq_sound a.sPre b.sPre (SP.and_l _ _ r1);
+  let r2 := SP.and_r _ _ r1;
+  let e3 := SP.nEq_sound a.sRw b.sRw (SP.and_l _ _ r2);
+  let r3 := SP.and_r _ _ r2;
+  let e4 := SP.bEq_sound a.wasWr b.wasWr (SP.and_l _ _ r3);
+  let r4 := SP.and_r _ _ r3;
+  let e5 := SP.nEq_sound a.sRef b.sRef (SP.and_l _ _ r4);
+  let r5 := SP.and_r _ _ r4;
+  let e6 := SP.bEq_sound a.open b.open (SP.and_l _ _ r5);
+  let e7 := SP.nEq_sound a.age b.age (SP.and_r _ _ r5);
+  Eq.trans (Eq.congrArg (fun (x : Nat) => SPMon.mk x a.sPre a.sRw a.wasWr a.sRef a.open a.age) e1)
+    (Eq.trans (Eq.congrArg (fun (x : Nat) => SPMon.mk b.sAct x a.sRw a.wasWr a.sRef a.open a.age) e2)
+    (Eq.trans (Eq.congrArg (fun (x : Nat) => SPMon.mk b.sAct b.sPre x a.wasWr a.sRef a.open a.age) e3)
+    (Eq.trans (Eq.congrArg (fun (x : Bool) => SPMon.mk b.sAct b.sPre b.sRw x a.sRef a.open a.age) e4)
+    (Eq.trans (Eq.congrArg (fun (x : Nat) => SPMon.mk b.sAct b.sPre b.sRw b.wasWr x a.open a.age) e5)
+    (Eq.trans (Eq.congrArg (fun (x : Bool) => SPMon.mk b.sAct b.sPre b.sRw b.wasWr b.sRef x a.age) e6)
+      (Eq.congrArg (fun (x : Nat) => SPMon.mk b.sAct b.sPre b.sRw b.wasWr b.sRef b.open x) e7))))))
 
 ------------------------------------------------------------------------------------
 -- Sets of states: buckets by the scheduler's control state
 
-def SP.Set : Type := List (SP.Sc × List SP.Mon)
+def SP.Set : Type := List (SPSc × List SPMon)
 
-def SP.memMon (m : SP.Mon) : List SP.Mon → Bool
+def SP.memMon (m : SPMon) : List SPMon → Bool
   | .nil => .false
-  | .cons x xs => Bool.or (SP.Mon.eqB m x) (SP.memMon m xs)
-def SP.memIf (mem : SP.S → SP.Set → Bool) (c : Bool) (s : SP.S) (b : SP.Sc × List SP.Mon) (bs : SP.Set) : Bool :=
-  match c with
-  | .true => SP.memMon s.mon b.2
-  | .false => mem s bs
-def SP.mem (s : SP.S) : SP.Set → Bool
+  | .cons x xs => Bool.or (SPMon.eqB m x) (SP.memMon m xs)
+def SP.memIf (c here rest : Bool) : Bool := match c with
+  | .true => here
+  | .false => rest
+def SP.mem (s : SPS) : SP.Set → Bool
   | .nil => .false
-  | .cons b bs => SP.memIf SP.mem (SP.Sc.eqB s.sc b.1) s b bs
+  | .cons b bs => SP.memIf (SPSc.eqB s.sc b.1) (SP.memMon s.mon b.2) (SP.mem s bs)
 -- add a state (no check that it is new)
-def SP.addMon (m : SP.Mon) (b : SP.Sc × List SP.Mon) : SP.Sc × List SP.Mon := (b.1, .cons m b.2)
-def SP.add (s : SP.S) : SP.Set → SP.Set
+def SP.addMon (m : SPMon) (b : SPSc × List SPMon) : SPSc × List SPMon := (b.1, .cons m b.2)
+def SP.add (s : SPS) : SP.Set → SP.Set
   | .nil => .cons (s.sc, .cons s.mon .nil) .nil
-  | .cons b bs => match SP.Sc.eqB s.sc b.1 with
+  | .cons b bs => match SPSc.eqB s.sc b.1 with
     | .true => .cons (SP.addMon s.mon b) bs
     | .false => .cons b (SP.add s bs)
 
 -- every state of a set, and every input
-def SP.allMon (f : SP.S → Bool) (c : SP.Sc) : List SP.Mon → Bool
+def SP.allMon (f : SPS → Bool) (c : SPSc) : List SPMon → Bool
   | .nil => .true
-  | .cons m ms => Bool.and (f (SP.S.mk c m)) (SP.allMon f c ms)
-def SP.all (f : SP.S → Bool) : SP.Set → Bool
+  | .cons m ms => Bool.and (f (SPS.mk c m)) (SP.allMon f c ms)
+def SP.all (f : SPS → Bool) : SP.Set → Bool
   | .nil => .true
   | .cons b bs => Bool.and (SP.allMon f b.1 b.2) (SP.all f bs)
-def SP.inputs : List SP.I :=
-  .cons (SP.I.mk .false .false .false) (.cons (SP.I.mk .false .false .true) (.cons (SP.I.mk .false .true .false)
-  (.cons (SP.I.mk .false .true .true) (.cons (SP.I.mk .true .false .false) (.cons (SP.I.mk .true .false .true)
-  (.cons (SP.I.mk .true .true .false) (.cons (SP.I.mk .true .true .true) .nil)))))))
-def SP.allI (g : SP.I → Bool) : Bool :=
-  Bool.and (g (SP.I.mk .false .false .false)) (Bool.and (g (SP.I.mk .false .false .true)) (Bool.and (g (SP.I.mk .false .true .false))
-  (Bool.and (g (SP.I.mk .false .true .true)) (Bool.and (g (SP.I.mk .true .false .false)) (Bool.and (g (SP.I.mk .true .false .true))
-  (Bool.and (g (SP.I.mk .true .true .false)) (g (SP.I.mk .true .true .true))))))))
+def SP.inputs : List SPI :=
+  .cons (SPI.mk .false .false .false) (.cons (SPI.mk .false .false .true) (.cons (SPI.mk .false .true .false)
+  (.cons (SPI.mk .false .true .true) (.cons (SPI.mk .true .false .false) (.cons (SPI.mk .true .false .true)
+  (.cons (SPI.mk .true .true .false) (.cons (SPI.mk .true .true .true) .nil)))))))
+def SP.allI (g : SPI → Bool) : Bool :=
+  Bool.and (g (SPI.mk .false .false .false)) (Bool.and (g (SPI.mk .false .false .true)) (Bool.and (g (SPI.mk .false .true .false))
+  (Bool.and (g (SPI.mk .false .true .true)) (Bool.and (g (SPI.mk .true .false .false)) (Bool.and (g (SPI.mk .true .false .true))
+  (Bool.and (g (SPI.mk .true .true .false)) (g (SPI.mk .true .true .true))))))))
 
 ------------------------------------------------------------------------------------
 -- The reachable states: breadth first, from the initial state
 
-def SP.succs (s : SP.S) : List SP.S := Hdl.map (fun (x : SP.I) => (SP.step s x).1) SP.inputs
+def SP.succs (s : SPS) : List SPS := Hdl.map (fun (x : SPI) => (SP.step s x).1) SP.inputs
 -- add the new ones among `xs` to `seen` and to the next frontier
-def SP.visit : List SP.S → SP.Set → List SP.S → SP.Set × List SP.S
+def SP.visit : List SPS → SP.Set → List SPS → SP.Set × List SPS
   | .nil, seen, next => (seen, next)
   | .cons x xs, seen, next => match SP.mem x seen with
     | .true => SP.visit xs seen next
     | .false => SP.visit xs (SP.add x seen) (.cons x next)
-def SP.expand : List SP.S → SP.Set → List SP.S → SP.Set × List SP.S
+def SP.expand : List SPS → SP.Set → List SPS → SP.Set × List SPS
   | .nil, seen, next => (seen, next)
   | .cons s ss, seen, next =>
     let r := SP.visit (SP.succs s) seen next;
     SP.expand ss r.1 r.2
-def SP.bfs : Nat → SP.Set → List SP.S → SP.Set
+def SP.bfs : Nat → SP.Set → List SPS → SP.Set
   | .zero, seen, _ => seen
   | .succ k, seen, frontier => match frontier with
     | .nil => seen
@@ -252,10 +249,10 @@ def SP.reach : SP.Set := SP.bfs 1000 (SP.add SP.init .nil) (.cons SP.init .nil)
 
 -- the check: the initial state is in, every step from a state in stays in and breaks
 -- no rule
-def SP.stepOk (s : SP.S) : Bool :=
-  SP.allI (fun (x : SP.I) => Bool.and (SP.mem (SP.step s x).1 SP.reach) (Bool.not (SP.step s x).2))
+def SP.stepOk (s : SPS) : Bool :=
+  SP.allI (fun (x : SPI) => Bool.and (SP.mem (SP.step s x).1 SP.reach) (Bool.not (SP.step s x).2))
 def SP.check : Bool := Bool.and (SP.mem SP.init SP.reach) (SP.all SP.stepOk SP.reach)
-def SP.count : Nat := List.foldl (fun (n : Nat) (b : SP.Sc × List SP.Mon) => n + List.length b.2) 0 SP.reach
+def SP.count : Nat := List.foldl (fun (n : Nat) (b : SPSc × List SPMon) => n + List.length b.2) 0 SP.reach
 
 ------------------------------------------------------------------------------------
 -- The proof
@@ -270,33 +267,33 @@ def SP.not_true : (a : Bool) → Bool.not a = .true → a = .false
   | .true, e => absurd e.1
 
 -- a monitor in a bucket's list satisfies what all of them do
-def SP.memMon_all (f : SP.S → Bool) (c : SP.Sc) (m : SP.Mon) :
-    (ms : List SP.Mon) → SP.memMon m ms = .true → SP.allMon f c ms = .true → f (SP.S.mk c m) = .true
+def SP.memMon_all (f : SPS → Bool) (c : SPSc) (m : SPMon) :
+    (ms : List SPMon) → SP.memMon m ms = .true → SP.allMon f c ms = .true → f (SPS.mk c m) = .true
   | .nil, hm, ha => absurd hm.1
-  | .cons x xs, hm, ha => Or.elim (SP.or_cases (SP.Mon.eqB m x) (SP.memMon m xs) hm)
-      (fun (e : SP.Mon.eqB m x = .true) =>
-        Eq.substProp (fun (y : SP.Mon) => f (SP.S.mk c y) = .true) (Eq.symm (SP.Mon.eqB_sound m x e)) (SP.and_l _ _ ha))
+  | .cons x xs, hm, ha => Or.elim (SP.or_cases (SPMon.eqB m x) (SP.memMon m xs) hm)
+      (fun (e : SPMon.eqB m x = .true) =>
+        Eq.substProp (fun (y : SPMon) => f (SPS.mk c y) = .true) (Eq.symm (SPMon.eqB_sound m x e)) (SP.and_l _ _ ha))
       (fun (h : SP.memMon m xs = .true) => SP.memMon_all f c m xs h (SP.and_r _ _ ha))
 
 -- a member of a set satisfies what all of its states do (the bucket case, given the
 -- claim for the rest of the set)
-def SP.mem_allIf (f : SP.S → Bool) (c : SP.Sc) (m : SP.Mon) (b : SP.Sc × List SP.Mon) (bs : SP.Set)
-    (ih : SP.mem (SP.S.mk c m) bs = .true → SP.all f bs = .true → f (SP.S.mk c m) = .true) :
-    (e : Bool) → SP.Sc.eqB c b.1 = e → SP.memIf SP.mem e (SP.S.mk c m) b bs = .true → SP.all f (.cons b bs) = .true →
-    f (SP.S.mk c m) = .true
+def SP.mem_allIf (f : SPS → Bool) (c : SPSc) (m : SPMon) (b : SPSc × List SPMon) (bs : SP.Set)
+    (ih : SP.mem (SPS.mk c m) bs = .true → SP.all f bs = .true → f (SPS.mk c m) = .true) :
+    (e : Bool) → SPSc.eqB c b.1 = e → SP.memIf e (SP.memMon m b.2) (SP.mem (SPS.mk c m) bs) = .true → SP.all f (.cons b bs) = .true →
+    f (SPS.mk c m) = .true
   | .true, he, hm, ha =>
-    Eq.substProp (fun (y : SP.Sc) => f (SP.S.mk y m) = .true) (Eq.symm (SP.Sc.eqB_sound c b.1 he))
+    Eq.substProp (fun (y : SPSc) => f (SPS.mk y m) = .true) (Eq.symm (SPSc.eqB_sound c b.1 he))
       (SP.memMon_all f b.1 m b.2 hm (SP.and_l _ _ ha))
   | .false, he, hm, ha => ih hm (SP.and_r _ _ ha)
-def SP.mem_all (f : SP.S → Bool) (c : SP.Sc) (m : SP.Mon) :
-    (L : SP.Set) → SP.mem (SP.S.mk c m) L = .true → SP.all f L = .true → f (SP.S.mk c m) = .true
+def SP.mem_all (f : SPS → Bool) (c : SPSc) (m : SPMon) :
+    (L : SP.Set) → SP.mem (SPS.mk c m) L = .true → SP.all f L = .true → f (SPS.mk c m) = .true
   | .nil, hm, ha => absurd hm.1
-  | .cons b bs, hm, ha => SP.mem_allIf f c m b bs (SP.mem_all f c m bs) (SP.Sc.eqB c b.1) rfl hm ha
-def SP.mem_all' (f : SP.S → Bool) (L : SP.Set) : (s : SP.S) → SP.mem s L = .true → SP.all f L = .true → f s = .true
-  | .mk c m, hm, ha => SP.mem_all f c m L hm ha
+  | .cons b bs, hm, ha => SP.mem_allIf f c m b bs (SP.mem_all f c m bs) (SPSc.eqB c b.1) rfl hm ha
+def SP.mem_all' (f : SPS → Bool) (L : SP.Set) (s : SPS) (hm : SP.mem s L = .true) (ha : SP.all f L = .true) : f s = .true :=
+  SP.mem_all f s.sc s.mon L hm ha
 
 -- every input
-def SP.allI_spec (g : SP.I → Bool) (h : SP.allI g = .true) : (x : SP.I) → g x = .true
+def SP.allI_spec (g : SPI → Bool) (h : SP.allI g = .true) : (x : SPI) → g x = .true
   | .mk .false .false .false => SP.and_l _ _ h
   | .mk .false .false .true => SP.and_l _ _ (SP.and_r _ _ h)
   | .mk .false .true .false => SP.and_l _ _ (SP.and_r _ _ (SP.and_r _ _ h))
@@ -307,16 +304,16 @@ def SP.allI_spec (g : SP.I → Bool) (h : SP.allI g = .true) : (x : SP.I) → g 
   | .mk .true .true .true => SP.and_r _ _ (SP.and_r _ _ (SP.and_r _ _ (SP.and_r _ _ (SP.and_r _ _ (SP.and_r _ _ (SP.and_r _ _ h))))))
 
 -- the reachable set is an invariant, and from it no step breaks a rule
-def SP.inv (s : SP.S) : Prop := SP.mem s SP.reach = .true
-def SP.stepOk_of (s : SP.S) (h : SP.inv s) : SP.stepOk s = .true :=
+def SP.inv (s : SPS) : Prop := SP.mem s SP.reach = .true
+def SP.stepOk_of (s : SPS) (h : SP.inv s) : SP.stepOk s = .true :=
   SP.mem_all' SP.stepOk SP.reach s h (SP.and_r _ _ SP.ok_true)
-def SP.inv_step (s : SP.S) (x : SP.I) (u : True) (h : SP.inv s) : SP.inv (SP.step s x).1 :=
+def SP.inv_step (s : SPS) (x : SPI) (u : True) (h : SP.inv s) : SP.inv (SP.step s x).1 :=
   SP.and_l _ _ (SP.allI_spec _ (SP.stepOk_of s h) x)
-def SP.inv_at (xs : Trace SP.I) (t : Nat) : SP.inv (Mealy.stateAt SP.M SP.init xs t) :=
-  Mealy.invariant SP.M SP.init xs (fun (x : SP.I) => True) SP.inv (SP.and_l _ _ SP.ok_true) SP.inv_step
+def SP.inv_at (xs : Trace SPI) (t : Nat) : SP.inv (Mealy.stateAt SP.M SP.init xs t) :=
+  Mealy.invariant SP.M SP.init xs (fun (x : SPI) => True) SP.inv (SP.and_l _ _ SP.ok_true) SP.inv_step
     (fun (u : Nat) => True.intro) t
 
 -- The theorem: whatever the inputs, the scheduler's command breaks no timing rule in
 -- any cycle, and no refresh waits more than `SP.ageMax` cycles.
-def SP.safe (xs : Trace SP.I) (t : Nat) : Mealy.outAt SP.M SP.init xs t = .false :=
+def SP.safe (xs : Trace SPI) (t : Nat) : Mealy.outAt SP.M SP.init xs t = .false :=
   SP.not_true _ (SP.and_r _ _ (SP.allI_spec _ (SP.stepOk_of (Mealy.stateAt SP.M SP.init xs t) (SP.inv_at xs t)) (xs t)))

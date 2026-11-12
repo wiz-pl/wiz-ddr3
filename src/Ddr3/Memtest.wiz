@@ -46,7 +46,9 @@ def Pr.hexDigit {r : HwTy → Type} [Hw r] (x : r (B 4)) : r (B 8) :=
 def Pr.hexFrom {r : HwTy → Type} [Hw r] {ω w : Nat} (x : r (B w)) : (ω k : Nat) → List (r (B 8))
   | .zero => .nil
   | .succ k => .cons (Pr.hexDigit (Hw.slice (k * 4) 4 x)) (Pr.hexFrom x k)
-def Pr.hex {r : HwTy → Type} [Hw r] {ω w : Nat} (x : r (B w)) (k : Nat) : List (r (B 8)) := Pr.hexFrom x k
+-- (zero-extended first: a 5-bit tap is two digits)
+def Pr.hex {r : HwTy → Type} [Hw r] {ω w : Nat} (x : r (B w)) (k : Nat) : List (r (B 8)) :=
+  Pr.hexFrom (Hw.cat (Hw.lit (k * 4) 0) x) k
 def Pr.crlf {r : HwTy → Type} [Hw r] : List (r (B 8)) := .cons (Hw.lit 8 13) (.cons (Hw.lit 8 10) .nil)
 def Pr.byteAt {r : HwTy → Type} [Hw r] (items : List (r (B 8))) (pos : r (B 9)) : r (B 8) :=
   U.select pos (fun (k : Nat) => Hdl.nthD (Hw.lit 8 0) items k) (List.length items)
