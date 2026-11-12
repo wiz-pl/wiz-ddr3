@@ -231,6 +231,13 @@ def pnrX (dirs : Dirs) (d : Arty.Device) (name xdc : String) : EIO Unit := do
     (.cons "--part_name" (.cons part (.cons "--frm_file" (.cons (dev d (name <+> ".frames"))
     (.cons "--output_file" (.cons (dev d (name <+> ".bit")) .nil))))))))
 
+-- the cache alone, for a look at what yosys makes of its memories
+def cacheC : Circuit (HwTy.prod CReq.code PortOut.code) (HwTy.prod CResp.code PortIn.code) :=
+  Circuit.mk CSt.code C.init (fun s x => C.step (CSt.unpack s) (CReq.unpack (Hw.fst x)) (PortOut.unpack (Hw.snd x)))
+def cachegen : EIO Unit := do
+  ensureDir "build";
+  FS.writeFile (build "cache.v") (Verilog.emit (Circuit.netlist "cache" cacheC))
+
 def probe2 (dirs : Dirs) : EIO Unit := do
   ensureDir "build";
   FS.writeFile (build "probe2.v") (Verilog.emitTop (Circuit.netlist "probe2" (Probe2.circuit 866)) Board.clocking);
@@ -341,6 +348,8 @@ def runArgs (a : Args) : EIO Unit := match a.words with
       | .true => EIO.bind (dirsOf a) probe
       | .false => match String.eq cmd "probe2" with
       | .true => EIO.bind (dirsOf a) probe2
+      | .false => match String.eq cmd "cachegen" with
+      | .true => cachegen
       | .false => match String.eq cmd "csim", rest with
         | .true, .cons w ps => csimRun (natOf w) (mpOf ps)
         | .true, .nil => csimRun 4000 MParams.default

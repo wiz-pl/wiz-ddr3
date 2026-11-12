@@ -27,13 +27,14 @@ structure CResp (r : HwTy → Type) where
 structure CSt (r : HwTy → Type) where
   data : r (HwTy.mem 9 128)
   tags : r (HwTy.mem 9 17)    -- bit 16 valid, bit 15 dirty, 14..0 the tag
-  st : r (B 3)                -- 0 idle, 1 compare, 2 write back, 3 read the line, 4 wait for it
+  st : r (B 3)                -- 0 idle, 1 compare, 2 write back, 3 read the line, 4 wait for it,
+                              -- 5 read the filled line again
   addr : r (B 28)
   we : r Bit
   wdata : r (B 32)
   wstrb : r (B 4)
-  line : r (B 128)
-  tagw : r (B 17)
+  line : r (B 128)            -- the block RAMs' read registers: the line and tag at the address
+  tagw : r (B 17)             -- read the cycle before (nothing else writes them)
   hits : r (B 32)
   misses : r (B 32)
   deriving Bundle
@@ -59,6 +60,7 @@ def C.step {r : HwTy → Type} [Hw r] (s : CSt r) (q : CReq r) (ddr : PortOut r)
   let fill := U.isLit s.st 3;
   let wait := U.isLit s.st 4;
   let start := U.band idle q.valid;
+  let again := U.isLit s.st 5;
   let idx := C.idx s.addr;
   let tg := C.tag s.addr;
   let valid := U.bit s.tagw 16;
@@ -81,11 +83,16 @@ def C.step {r : HwTy → Type} [Hw r] (s : CSt r) (q : CReq r) (ddr : PortOut r)
   let qIdx := C.idx q.addr;
   let st := Hw.mux start (Hw.lit 3 1) (Hw.mux hitNow (Hw.lit 3 0)
     (Hw.mux missNow (Hw.mux (U.band valid dirty) (Hw.lit 3 2) (Hw.lit 3 3))
-    (Hw.mux (U.band wb acc) (Hw.lit 3 3) (Hw.mux (U.band fill acc) (Hw.lit 3 4) (Hw.mux got (Hw.lit 3 1) s.st)))));
+    (Hw.mux (U.band wb acc) (Hw.lit 3 3) (Hw.mux (U.band fill acc) (Hw.lit 3 4)
+    (Hw.mux got (Hw.lit 3 5) (Hw.mux again (Hw.lit 3 1) s.st))))));
+  -- every cycle, a plain registered read of both RAMs (the request's line when one starts,
+  -- else the current one), so that yosys maps them to block RAM; after a fill the line is
+  -- read again (state 5), since a read in the cycle of the write returns the old word
+  let rdIdx := Hw.mux start qIdx idx;
   let ns := CSt.mk data tags st (Hw.mux start q.addr s.addr) (Hw.mux start q.we s.we) (Hw.mux start q.wdata s.wdata)
     (Hw.mux start q.wstrb s.wstrb)
-    (Hw.mux start (Hw.memRead s.data qIdx) (Hw.mux got ddr.rdata s.line))
-    (Hw.mux start (Hw.memRead s.tags qIdx) (Hw.mux got newTag s.tagw))
+    (Hw.memRead s.data rdIdx)
+    (Hw.memRead s.tags rdIdx)
     (Hw.mux hitNow (U.inc s.hits) s.hits) (Hw.mux missNow (U.inc s.misses) s.misses);
   Hw.pair (CSt.pack ns) (Hw.pair (CResp.pack (CResp.mk hitNow (U.band hitNow (U.bnot s.we)) (C.word s.line w)))
     (PortIn.pack dreq))
