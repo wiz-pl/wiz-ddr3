@@ -77,10 +77,10 @@ structure MtSt (r : HwTy → Type) where
   rawAnd : r (B 128)    -- every ISERDES bit never seen low
   dqsOr : r (B 2)       -- DQS ever seen high, and never seen low
   dqsAnd : r (B 2)
-  dIss : r Bit          -- the dump's read was accepted
-  dk : r (B 5)          -- capturing: 1 … 16 after the RD
-  dline : r (B 4)
-  dmem : r (HwTy.mem 4 128)   -- the raw words of the 16 cycles from the RD on
+  dIss : r (B 2)        -- the dump's write (1) and read (2) were accepted
+  dk : r (B 6)          -- capturing: 1 … 16 after the WR, 17 … 32 after the RD
+  dline : r (B 5)
+  dmem : r (HwTy.mem 5 144)   -- DQS's then DQ's raw words of the 16 cycles from the WR, from the RD
   deriving Bundle
 
 structure MtIn (r : HwTy → Type) where
@@ -112,8 +112,12 @@ def Mt.step {r : HwTy → Type} [Hw r] (t : Timing) (ab n : Nat) (s : MtSt r) (x
   let a24 := Hw.slice 0 24 s.addr;
   let wdata := Mt.data s.pass a24 s.lfsr;
   let dumping := U.isLit s.mode 4;
-  let req := PortIn.mk (U.bor (U.band testing (U.band (U.bnot last) (U.bnot s.waiting))) (U.band dumping (U.bnot s.dIss)))
-    (U.band testing (U.bnot s.reading)) (Hw.mux dumping (Hw.lit 24 0) a24) wdata (Hw.lit 16 65535);
+  -- the dump: a write of the calibration pattern to burst 1, then (after its capture) a read
+  let dWr := U.band dumping (U.isZero s.dIss);
+  let dRd := U.band dumping (U.band (U.isLit s.dIss 1) (U.isLit s.dk 17));
+  let req := PortIn.mk (U.bor (U.band testing (U.band (U.bnot last) (U.bnot s.waiting))) (U.bor dWr dRd))
+    (U.bor (U.band testing (U.bnot s.reading)) dWr) (Hw.mux dumping (Hw.lit 24 1) a24)
+    (Hw.mux dumping (Hw.lit 128 Pat.burst) wdata) (Hw.lit 16 65535);
   let co := Ctrl.step t cs req (PhyIn.unpack s.phy);
   let po := PortOut.unpack (Hw.fst (Hw.snd co));
   let dfi := Dfi.unpack (Hw.snd (Hw.snd co));
@@ -131,7 +135,7 @@ def Mt.step {r : HwTy → Type} [Hw r] (t : Timing) (ab n : Nat) (s : MtSt r) (x
     (List.append (Pr.str " cyc=") (List.append (Pr.hex s.cycles 8) (List.append (Pr.str " first=") (List.append (Pr.hex s.firstA 6)
     (List.append (Pr.str " got=") (List.append (Pr.hex s.firstG 8) (List.append (Pr.str " exp=") (List.append (Pr.hex s.firstE 8) Pr.crlf)))))))))));
   let dumpMsg := List.append (Pr.str "D") (List.append (Pr.hex s.dline 1) (List.append (Pr.str " ")
-    (List.append (Pr.hex (Hw.memRead s.dmem s.dline) 32) Pr.crlf)));
+    (List.append (Pr.hex (Hw.memRead s.dmem s.dline) 36) Pr.crlf)));
   let printing := U.bor (U.bor (U.isLit s.mode 1) (U.isLit s.mode 3)) (U.isLit s.mode 5);
   let msgLen := Hw.mux (U.isLit s.mode 1) (Hw.lit 9 (List.length calMsg))
     (Hw.mux (U.isLit s.mode 5) (Hw.lit 9 (List.length dumpMsg)) (Hw.lit 9 (List.length passMsg)));
@@ -141,9 +145,11 @@ def Mt.step {r : HwTy → Type} [Hw r] (t : Timing) (ab n : Nat) (s : MtSt r) (x
     (Hw.mux (U.isLit s.mode 5) (Pr.byteAt dumpMsg s.pos) (Pr.byteAt passMsg s.pos));
   let printed := U.band printing (U.band (U.bnot more) (Tx.idle txs));
   let rdNow := U.band (U.band cs.ras (U.bnot cs.cas)) cs.wen;
-  let capturing := U.bnot (U.isZero s.dk);
-  let dDone := U.isLit s.dk 16;
-  let lastLine := U.isLit s.dline 15;
+  let wrNow := U.band (U.band cs.ras (U.bnot cs.cas)) (U.bnot cs.wen);
+  let capturing := U.bor (U.band (Hw.ult (Hw.lit 6 0) s.dk) (Hw.ult s.dk (Hw.lit 6 17)))
+    (U.band (Hw.ult (Hw.lit 6 17) s.dk) (Hw.ult s.dk (Hw.lit 6 34)));
+  let dDone := U.isLit s.dk 34;
+  let lastLine := U.isLit s.dline 31;
   let mode := Hw.mux (U.band (U.isZero s.mode) cs.calDone) (Hw.lit 3 1)
     (Hw.mux (U.band printed (U.isLit s.mode 1)) (Hw.lit 3 4)
     (Hw.mux (U.band dumping dDone) (Hw.lit 3 5)
@@ -169,17 +175,19 @@ def Mt.step {r : HwTy → Type} [Hw r] (t : Timing) (ab n : Nat) (s : MtSt r) (x
     (Tx.step n txs send byte)
     (Hw.or s.rawOr (PhyIn.unpack s.phy).raw) (Hw.and s.rawAnd (PhyIn.unpack s.phy).raw)
     (Hw.or s.dqsOr (PhyIn.unpack s.phy).dqs) (Hw.and s.dqsAnd (PhyIn.unpack s.phy).dqs)
-    (Hw.or s.dIss (U.band dumping accept))
-    (Hw.mux (U.band dumping (U.band rdNow (U.bnot capturing))) (Hw.lit 5 1)
-      (Hw.mux (U.band capturing (U.bnot dDone)) (U.inc s.dk) s.dk))
+    (Hw.mux (U.band dumping accept) (U.inc s.dIss) s.dIss)
+    (Hw.mux (U.band dumping (U.band wrNow (U.isZero s.dk))) (Hw.lit 6 1)
+      (Hw.mux (U.band dumping (U.band rdNow (U.isLit s.dk 17))) (Hw.lit 6 18)
+      (Hw.mux capturing (U.inc s.dk) s.dk)))
     (Hw.mux (U.band printed (U.isLit s.mode 5)) (U.inc s.dline) s.dline)
-    (Hw.memWrite s.dmem (U.band capturing (U.bnot dDone)) (Hw.slice 0 4 (U.dec s.dk)) (PhyIn.unpack s.phy).raw);
+    (Hw.memWrite s.dmem capturing (Hw.mux (Hw.ult s.dk (Hw.lit 6 17)) (Hw.slice 0 5 (U.dec s.dk)) (Hw.slice 0 5 (Hw.sub s.dk (Hw.lit 6 2))))
+      (Hw.cat (PhyIn.unpack s.phy).dqsRaw (PhyIn.unpack s.phy).raw));
   Hw.pair (MtSt.pack st) (Hw.pair (Hw.fst phy)
     (Board.pack (Board.mk txs.line (Hw.cat (Hw.cat (U.bit s.passes 0) (U.bor (U.bnot (U.isZero s.errs)) U.lo)) (Hw.cat po.calFail po.calDone)))))
 
 def Mt.z (n : Nat) : HwTy.El (B n) := BitVec.ofNat n 0
 def Mt.init (t : Timing) : HwTy.El MtSt.code :=
-  Bundle.toEl MtSt.bundle (MtSt.mk (Ctrl.init t) (Mt.z 128, (Mt.z 1, Mt.z 2)) (Mt.z 8) (Mt.z 3) (Mt.z 2) (Mt.z 1) (Mt.z 25)
+  Bundle.toEl MtSt.bundle (MtSt.mk (Ctrl.init t) (Mt.z 128, (Mt.z 1, (Mt.z 2, Mt.z 16))) (Mt.z 8) (Mt.z 3) (Mt.z 2) (Mt.z 1) (Mt.z 25)
     (Mt.z 1) (Mt.z 24) (Mt.z 128) (BitVec.ofNat 32 Mt.seed) (Mt.z 32) (Mt.z 32) (Mt.z 24) (Mt.z 32) (Mt.z 32)
     (Mt.z 8) (Mt.z 9) (Bundle.toEl Tx.bundle (Tx.mk (BitVec.ofNat 1 1) (Mt.z 4) (Mt.z 10) (BitVec.ofNat 9 511)))
-    (Mt.z 128) (BitVec.ofNat 128 (Nat.pow 2 128 - 1)) (Mt.z 2) (BitVec.ofNat 2 3) (Mt.z 1) (Mt.z 5) (Mt.z 4) (fun (a : BitVec 4) => BitVec.ofNat 128 0))
+    (Mt.z 128) (BitVec.ofNat 128 (Nat.pow 2 128 - 1)) (Mt.z 2) (BitVec.ofNat 2 3) (Mt.z 2) (Mt.z 6) (Mt.z 5) (fun (a : BitVec 5) => BitVec.ofNat 144 0))

@@ -75,8 +75,9 @@ def C.step {r : HwTy → Type} [Hw r] (s : CSt r) (q : CReq r) (ddr : PortOut r)
   let acc := U.band dreq.valid ddr.ready;
   let got := U.band wait ddr.rvalid;
   let newTag := Hw.cat (Hw.cat U.hi U.lo) tg;
-  let data := Hw.memWrite (Hw.memWrite s.data wHit idx merged) got idx ddr.rdata;
-  let tags := Hw.memWrite (Hw.memWrite s.tags wHit (C.idx s.addr) (Hw.cat (Hw.cat U.hi U.hi) tg)) got idx newTag;
+  -- one write port each (a hit's merge or a fill), so that they map to block RAM
+  let data := Hw.memWrite s.data (U.bor wHit got) idx (Hw.mux got ddr.rdata merged);
+  let tags := Hw.memWrite s.tags (U.bor wHit got) idx (Hw.mux got newTag (Hw.cat (Hw.cat U.hi U.hi) tg));
   let qIdx := C.idx q.addr;
   let st := Hw.mux start (Hw.lit 3 1) (Hw.mux hitNow (Hw.lit 3 0)
     (Hw.mux missNow (Hw.mux (U.band valid dirty) (Hw.lit 3 2) (Hw.lit 3 3))

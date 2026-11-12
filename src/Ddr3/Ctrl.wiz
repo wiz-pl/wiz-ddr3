@@ -73,6 +73,9 @@ structure Dfi (r : HwTy → Type) where
   serDm : r (B 16)
   serDqs : r (B 8)
   serOe : r Bit
+  serDqsOe : r Bit      -- DQS's own drive: DQS is serialised a cycle later than DQ, because its
+                        -- OSERDES's CLK (sys4x at 90°) loads the CLKDIV word a cycle early
+                        -- (seen on the board; LiteDRAM's A7 PHY registers its DQS pattern too)
   deriving Bundle
 
 -- from the PHY: the ISERDES words (bit j*8 + k: DQ j, sample k, k = 0 the earliest),
@@ -81,6 +84,7 @@ structure PhyIn (r : HwTy → Type) where
   raw : r (B 128)
   rdy : r Bit
   dqs : r (B 2)         -- DQS1's and DQS0's input buffers, sampled (a diagnostic)
+  dqsRaw : r (B 16)     -- DQS1's and DQS0's ISERDES words, as raw's (a diagnostic)
   deriving Bundle
 
 structure St (r : HwTy → Type) where
@@ -497,12 +501,13 @@ def Ctrl.step {r : HwTy → Type} [Hw r] (t : Timing) (s : St r) (p : PortIn r) 
   let dmV := Hw.pair (Ser.cycle (fun (b : Nat) => U.bit s.wdm (b * 2)) h0 wData h2 w)
     (Ser.cycle (fun (b : Nat) => U.bit s.wdm (b * 2 + 1)) h0 wData h2 w);
   let serDm := U.ofBits (fun (p : Nat) => Ser.dmBit dmV p) 16;
-  let serDqs := Ser.cycle (fun (b : Nat) => Ser.dqs b) h0 wData h2 w;
+  let serDqs := Ser.cycle (fun (b : Nat) => Ser.dqs b) wData h2 (U.bit s.wrHist (t.wrLatency + 1)) w;
+  let serDqsOe := U.bor wData (U.bor h2 (U.bit s.wrHist (t.wrLatency + 1)));
   let serOe := U.bor h0 (U.bor wData h2);
   let dfi := Dfi.mk s.ras s.cas s.wen s.ba s.a s.cke (Hw.or (Hw.or wrNow (Hw.slice 0 1 s.wrHist)) (Hw.or (U.bit s.wrHist 1) (U.bit s.wrHist 2)))
     s.rstN s.wdata s.wdm wData
     (Hw.or (U.bit s.wrHist (t.wrLatency - 2)) (Hw.or wData (U.bit s.wrHist t.wrLatency))) wData
-    s.dlyLd (Hw.mux s.calDone s.tap0 s.ctap) (Hw.mux s.calDone s.tap1 s.ctap) serDq serDm serDqs serOe;
+    s.dlyLd (Hw.mux s.calDone s.tap0 s.ctap) (Hw.mux s.calDone s.tap1 s.ctap) serDq serDm serDqs serOe serDqsOe;
   let out := PortOut.mk ready rvalid rdata s.calDone s.calFail s.tap0 s.tap1 s.slip0 s.slip1 s.latR s.map0 s.map1 s.cw;
   let st := St.mk ini.phase ini.timer ini.step ini.rstN ini.cke cmd.ras cmd.cas cmd.wen cmd.ba cmd.a
     sn.sst sn.stimer sn.swe sn.sba sn.srow sn.scol sn.wdata sn.wdm refCnt sn.refPend wrHist rdHist

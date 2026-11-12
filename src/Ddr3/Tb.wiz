@@ -24,6 +24,7 @@ structure Gen (r : HwTy → Type) where
   badIdx : r (B 6)
   badGot : r (B 128)
   badExp : r (B 128)
+  serBad : r (B 16)     -- cycles where the serialised write data is not the burst
   deriving Bundle
 
 structure TbSt (r : HwTy → Type) where
@@ -54,6 +55,7 @@ structure TbOut (r : HwTy → Type) where
   badIdx : r (B 6)
   badGot : r (B 128)
   badExp : r (B 128)
+  serBad : r (B 16)
   deriving Bundle
 
 -- the burst address of index i: row {1, i5, 0…, i4, i5}, bank i3..i1, column {i0, 0…, i0}
@@ -74,7 +76,12 @@ def Tb.step {r : HwTy → Type} [Hw r] (t : Timing) (mp : MParams) (s : TbSt r) 
   let req := Gen.req cs.calDone g;
   let co := Ctrl.step t cs req (PhyIn.unpack s.phy);
   let po := PortOut.unpack (Hw.fst (Hw.snd co));
-  let mo := Model.step t mp (MSt.unpack s.model) (Dfi.unpack (Hw.snd (Hw.snd co)));
+  let d := Dfi.unpack (Hw.snd (Hw.snd co));
+  let mo := Model.step t mp (MSt.unpack s.model) d;
+  -- with no write shift (calibration's first try), the serialised data in the data cycle
+  -- must be the burst, DM the mask, DQS toggling, all driven
+  let serWrong := U.band d.dqOe (U.bnot (U.band (U.band (Hw.eq d.serDq d.wrdata) (Hw.eq d.serDm d.wrdm))
+    d.serOe));
   let v := Viol.unpack (Hw.snd (Hw.snd mo));
   let accept := U.band req.valid po.ready;
   let idx := Hw.slice 8 6 g.lfsr;
@@ -90,18 +97,19 @@ def Tb.step {r : HwTy → Type} [Hw r] (t : Timing) (mp : MParams) (s : TbSt r) 
     (Hw.mux opDone (U.inc g.ops) g.ops) (Hw.mux back (U.inc g.reads) g.reads) (Hw.mux mismatch (U.inc g.bad) g.bad)
     (U.inc g.cycle) (Hw.mux (U.band accept (U.isZero g.ops)) g.cycle g.firstOp)
     (Hw.mux rAcc idx g.ridx)
-    (Hw.mux first g.cycle g.badAt) (Hw.mux first g.ridx g.badIdx) (Hw.mux first po.rdata g.badGot) (Hw.mux first g.expect g.badExp);
+    (Hw.mux first g.cycle g.badAt) (Hw.mux first g.ridx g.badIdx) (Hw.mux first po.rdata g.badGot) (Hw.mux first g.expect g.badExp)
+    (Hw.mux serWrong (U.inc g.serBad) g.serBad);
   let st := TbSt.mk (Hw.fst co) (Hw.fst mo) (Hw.fst (Hw.snd mo)) (Gen.pack gn);
   Hw.pair (TbSt.pack st) (TbOut.pack (TbOut.mk po.calDone po.calFail po.tap0 po.tap1 po.slip0 po.slip1 po.lat
-    v.err v.ecode v.at v.refs g.ops g.reads g.bad g.cycle g.firstOp g.badAt g.badIdx g.badGot g.badExp))
+    v.err v.ecode v.at v.refs g.ops g.reads g.bad g.cycle g.firstOp g.badAt g.badIdx g.badGot g.badExp g.serBad))
 
 def Tb.gen0 : HwTy.El Gen.code :=
   Bundle.toEl Gen.bundle (Gen.mk (BitVec.ofNat 32 2463534242) (BitVec.ofNat 1 0) (BitVec.ofNat 128 0)
     (fun (a : BitVec 6) => BitVec.ofNat 128 0) (BitVec.ofNat 16 0) (BitVec.ofNat 16 0) (BitVec.ofNat 16 0)
     (BitVec.ofNat 32 0) (BitVec.ofNat 32 0) (BitVec.ofNat 6 0) (BitVec.ofNat 32 0) (BitVec.ofNat 6 0)
-    (BitVec.ofNat 128 0) (BitVec.ofNat 128 0))
+    (BitVec.ofNat 128 0) (BitVec.ofNat 128 0) (BitVec.ofNat 16 0))
 def Tb.init (t : Timing) : HwTy.El TbSt.code :=
-  Bundle.toEl TbSt.bundle (TbSt.mk (Ctrl.init t) Model.init (BitVec.ofNat 128 0, (BitVec.ofNat 1 0, BitVec.ofNat 2 0)) Tb.gen0)
+  Bundle.toEl TbSt.bundle (TbSt.mk (Ctrl.init t) Model.init (BitVec.ofNat 128 0, (BitVec.ofNat 1 0, (BitVec.ofNat 2 0, BitVec.ofNat 16 0))) Tb.gen0)
 
 -- no inputs: the generator drives everything
 def Tb.circuit (t : Timing) (mp : MParams) : Circuit Bit TbOut.code :=

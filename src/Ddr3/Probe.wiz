@@ -28,7 +28,7 @@ def Probe.step {r : HwTy → Type} [Hw r] (n : Nat) (s : PrSt r) (x : MtIn r) :
   let pat := Hw.cat (Hw.cat (Hw.slice 0 32 (Hw.cat s.cnt (Hw.lit 6 45))) (Hw.lit 32 2863311530))
     (Hw.cat (Hw.lit 32 4042322160) (Hw.slice 0 32 (Hw.cat (Hw.lit 6 51) s.cnt)));
   let dfi := Dfi.mk U.hi U.hi U.hi (Hw.lit 3 0) (Hw.lit 14 0) U.lo U.lo U.lo pat (Hw.lit 16 0) U.hi U.hi U.hi
-    U.lo (Hw.lit 5 0) (Hw.lit 5 0) pat (Hw.lit 16 0) (Hw.lit 8 85) U.hi;
+    U.lo (Hw.lit 5 0) (Hw.lit 5 0) pat (Hw.lit 16 0) (Hw.lit 8 85) U.hi U.hi;
   let phy := Phy.io (PhyClk.mk x.sys4x x.sys4xDqs x.ref200) phyRst U.lo dfi;
   let raw := (PhyIn.unpack s.phy).raw;
   let txs := Tx.unpack s.tx;
@@ -47,7 +47,7 @@ def Probe.step {r : HwTy → Type} [Hw r] (n : Nat) (s : PrSt r) (x : MtIn r) :
   Hw.pair (PrSt.pack st) (Hw.pair (Hw.fst phy) (Board.pack (Board.mk txs.line (Hw.cat (Hw.lit 3 0) (U.bit s.cnt 25)))))
 
 def Probe.init : HwTy.El PrSt.code :=
-  Bundle.toEl PrSt.bundle (PrSt.mk (Mt.z 128, (Mt.z 1, Mt.z 2)) (Mt.z 8) (BitVec.ofNat 26 1) (Mt.z 128) (Mt.z 128) (Mt.z 128)
+  Bundle.toEl PrSt.bundle (PrSt.mk (Mt.z 128, (Mt.z 1, (Mt.z 2, Mt.z 16))) (Mt.z 8) (BitVec.ofNat 26 1) (Mt.z 128) (Mt.z 128) (Mt.z 128)
     (Mt.z 2) (BitVec.ofNat 2 3) (Mt.z 9) (Bundle.toEl Tx.bundle (Tx.mk (BitVec.ofNat 1 1) (Mt.z 4) (Mt.z 10) (BitVec.ofNat 9 511))))
 def Probe.circuit (n : Nat) : Circuit MtIn.code (HwTy.prod Ddr3Pads.code Board.code) :=
   Circuit.mk PrSt.code Probe.init (fun s x => Probe.step n (PrSt.unpack s) (MtIn.unpack x))

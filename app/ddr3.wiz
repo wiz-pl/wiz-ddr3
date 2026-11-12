@@ -93,6 +93,7 @@ def showOut (o : HwTy.El TbOut.code) : String :=
   <+> " cycle=" <+> Hdl.show v.cycle.toNat <+> " firstOp=" <+> Hdl.show v.firstOp.toNat
   <+> "\nfirst mismatch: cycle=" <+> Hdl.show v.badAt.toNat <+> " index=" <+> Hdl.show v.badIdx.toNat
   <+> "\n  got=" <+> Hdl.show v.badGot.toNat <+> "\n  exp=" <+> Hdl.show v.badExp.toNat
+  <+> "\nserialisation mismatches=" <+> Hdl.show v.serBad.toNat
 
 def simRun (n : Nat) (mp : MParams) : EIO Unit := say (showOut (Tb.run Timing.sim mp n))
 
