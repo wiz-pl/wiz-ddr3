@@ -84,8 +84,8 @@ def Phy.dqs {r : HwTy → Type} [Hw r] (c : PhyClk r) (rst : r Bit) (d : Dfi r) 
   X7.iobufdsT (Hw.fst ser) (Hw.snd ser)
 -- DQS read back through an IDELAY (tap 0) and an ISERDES, as a DQ is (a diagnostic: sample
 -- k, k = 0 the earliest)
-def Phy.dqsIn {r : HwTy → Type} [Hw r] (c : PhyClk r) (rst : r Bit) (o : r Bit) : r (B 8) :=
-  let dly := X7.idelay U.lo U.lo U.lo (Hw.lit 5 0) o;
+def Phy.dqsIn {r : HwTy → Type} [Hw r] (c : PhyClk r) (rst : r Bit) (ld : r Bit) (tap : r (B 5)) (o : r Bit) : r (B 8) :=
+  let dly := X7.idelay U.lo U.lo ld tap o;
   let q := X7.iserdes c.sys4x Hw.clock rst (Hw.fst dly);
   U.ofBits (fun (k : Nat) => U.bit q (7 - k)) 8
 
@@ -109,4 +109,4 @@ def Phy.io {r : HwTy → Type} [Hw r] (c : PhyClk r) (rst : r Bit) (rstN : r Bit
   Hw.pair (Ddr3Pads.pack pads) (PhyIn.pack (PhyIn.mk (Phy.raw (fun (j : Nat) => Hw.fst (Hw.snd (V.getN 15 dqAll j)))) rdy
     -- (DQS's input buffer feeds its IDELAY only: a fabric tap as well is routed through the
     -- IDELAY as FIXED, which fasm2frames rejects)
-    (Hw.lit 2 0) (Hw.cat (Phy.dqsIn c rst (Hw.fst dqs1)) (Phy.dqsIn c rst (Hw.fst dqs0)))))
+    (Hw.lit 2 0) (Hw.cat (Phy.dqsIn c rst d.dlyLd d.tap1 (Hw.fst dqs1)) (Phy.dqsIn c rst d.dlyLd d.tap0 (Hw.fst dqs0)))))
