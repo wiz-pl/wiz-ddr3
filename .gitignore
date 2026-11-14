@@ -5,3 +5,4 @@ build/
 grail.local.wiz
 bits/
 micron/
+wiz-toolchain.local
