@@ -1,8 +1,8 @@
 import Hdl.Core
+import Hdl.Vocab
 -- Small helpers over `Hw`: bits by index, buses built bit by bit, multiplexers by a
 -- signal's value, and counters.
 
-def Bit : HwTy := HwTy.bits 1
 def B (n : Nat) : HwTy := HwTy.bits n
 
 def U.hi {r : HwTy → Type} [Hw r] : r Bit := Hw.lit 1 1

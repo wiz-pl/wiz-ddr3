@@ -1,4 +1,5 @@
 import Ddr3.Ctrl
+import Hdl.Vocab
 -- A behavioural DDR3 device at the controller's interface (`Dfi` in, `PhyIn` out), for
 -- simulation: it stores what is written, returns it on reads the way the PHY would (the
 -- ISERDES words, with a read latency and a bit offset the calibration must find, and
@@ -16,8 +17,6 @@ import Ddr3.Ctrl
 --   writes   DQS driven the cycle before the data (preamble) and toggling with it
 --
 -- The first violation is kept (sticky): its code and the cycle it happened in.
-
-def B8 : HwTy := HwTy.bits 8
 
 -- error codes
 def E.actOpen : Nat := 1
