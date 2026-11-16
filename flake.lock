@@ -97,15 +97,16 @@
         "nixpkgs": "nixpkgs_2"
       },
       "locked": {
-        "lastModified": 1794445428,
-        "narHash": "sha256-470sV2/DQksprgDQt919uY1pDt2VEh4DX1fuat4Jn2s=",
-        "owner": "badly-drawn-wizards",
+        "lastModified": 1794537757,
+        "narHash": "sha256-SKDgOeANDrthqp8KMNoho2tekUxtOp72EQLAMIexl0A=",
+        "owner": "wiz-pl",
         "repo": "wiz",
-        "rev": "50cd3e7691dd7e63ff72c33aa24b68a032179c8d",
+        "rev": "4f228dd2289a93cfdfcb5c1a65307e2a1489912c",
         "type": "github"
       },
       "original": {
-        "owner": "badly-drawn-wizards",
+        "owner": "wiz-pl",
+        "ref": "agent/hdl-prim",
         "repo": "wiz",
         "type": "github"
       }

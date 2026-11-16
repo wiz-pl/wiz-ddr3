@@ -106,6 +106,9 @@ structure MSt (r : HwTy → Type) where
   -- the IDELAY taps the controller set
   tap0 : r (B 5)
   tap1 : r (B 5)
+  -- MR3's multipurpose register enable (A2): reads then return 0101… on every DQ,
+  -- ignore writes, need no open bank, and no REF/PRE/ZQ may be issued
+  mprEn : r Bit
   deriving Bundle
 
 -- The model's parameters: the read latency in cycles from the RD's cycle to its first
@@ -178,6 +181,8 @@ def Model.step {r : HwTy → Type} [Hw r] (t : Timing) (mp : MParams) (s : MSt r
   let isMrs := U.band (U.band (U.bnot d.ras_n) (U.bnot d.cas_n)) (U.bnot d.we_n);
   let isZq := U.band (U.band d.ras_n d.cas_n) (U.bnot d.we_n);
   let any := U.bnot (U.band (U.band d.ras_n d.cas_n) d.we_n);
+  let mprEn := s.mprEn;
+  let mprSet := U.band isMrs (U.isLit d.ba 3);
   let bank := Bank.unpack (U.select d.ba (fun (k : Nat) => V.get s.banks k) 8);
   let allClosed := U.bnot (U.bor (U.bor (U.bor (Model.bank s 0).open (Model.bank s 1).open)
     (U.bor (Model.bank s 2).open (Model.bank s 3).open))
@@ -192,8 +197,8 @@ def Model.step {r : HwTy → Type} [Hw r] (t : Timing) (mp : MParams) (s : MSt r
     (.cons (U.band isAct (U.bnot (Sat.ge bank.sAct t.tRC)), E.actRc)
     (.cons (U.band any (U.bnot (Sat.ge s.sRef t.tRFC)), E.rfc)
     (.cons (U.band (U.band any (U.bnot isMrs)) (U.bnot (Sat.ge s.sMrs t.tMOD)), E.mod)
-    (.cons (U.band (U.bor isRd isWr) (U.bnot bank.open), E.rwClosed)
-    (.cons (U.band (U.bor isRd isWr) (U.bnot (Sat.ge bank.sAct t.tRCD)), E.rcd)
+    (.cons (U.band (U.band (U.bor isRd isWr) (U.bnot mprEn)) (U.bnot bank.open), E.rwClosed)
+    (.cons (U.band (U.band (U.bor isRd isWr) (U.bnot mprEn)) (U.bnot (Sat.ge bank.sAct t.tRCD)), E.rcd)
     (.cons (U.band isRd (U.bnot (Sat.ge s.sWrAny (t.wrLatency + 1 + t.tWTR))), E.wtr)
     (.cons (U.band isWr (U.bnot (Sat.ge s.sRdAny t.tRTW)), E.rtw)
     (.cons (U.band (U.band isPre bank.open) (U.bnot (Sat.ge bank.sAct t.tRAS)), E.ras)
@@ -214,8 +219,10 @@ def Model.step {r : HwTy → Type} [Hw r] (t : Timing) (mp : MParams) (s : MSt r
   let first := U.band viol.1 (U.bnot s.err);
   -- the burst address of a RD or WR: the bank's open row, the bank, A9..A3
   let addr := Hw.cat bank.row (Hw.cat d.ba (Hw.slice 3 7 d.a));
-  let mem1 := Hw.memWrite s.mem s.wv2 s.wa2 (Model.merge (Hw.memRead s.mem s.wa2) d.wrdata d.wrdm);
-  let rdData := Hw.memRead s.mem addr;
+  let wrOk := U.band s.wv2 (U.bnot mprEn);
+  let mem1 := Hw.memWrite s.mem wrOk s.wa2 (Model.merge (Hw.memRead s.mem s.wa2) d.wrdata d.wrdm);
+  -- (in MPR mode every read returns the calibration pattern, whatever the address)
+  let rdData := Hw.mux mprEn (Hw.lit 128 Pat.mprBurst) (Hw.memRead s.mem addr);
   let pipe := Model.pipeNext s (Hw.pair isRd rdData);
   let outNext := match Nat.beq mp.lat 1 with
     | .true => Hw.pair isRd rdData
@@ -232,11 +239,16 @@ def Model.step {r : HwTy → Type} [Hw r] (t : Timing) (mp : MParams) (s : MSt r
     (Hw.mux (U.bor (U.band isMrs (U.bnot badMrs)) (U.band isZq (U.bnot badZq))) (Hw.mux initing (U.inc s.stage) s.stage) s.stage)
     (Hw.or s.zqDone isZq)
     (Hw.or s.err viol.1) (Hw.mux first viol.2 s.ecode) (Hw.mux first s.cycle s.at)
-    (Hw.mux isRef (U.inc s.refs) s.refs) (Hw.mux s.wv2 (U.inc s.writes) s.writes) (Hw.mux isRd (U.inc s.reads) s.reads)
-    addr isWr s.wa1 s.wv1 d.dqsOe
+    (Hw.mux isRef (U.inc s.refs) s.refs) (Hw.mux wrOk (U.inc s.writes) s.writes) (Hw.mux isRd (U.inc s.reads) s.reads)
+    addr (U.band isWr (U.bnot mprEn)) s.wa1 s.wv1 d.dqsOe
     pipe (Hw.fst outNext) (Hw.snd outNext) s.outV s.outD
-    (Hw.mux d.dlyLd d.tap0 s.tap0) (Hw.mux d.dlyLd d.tap1 s.tap1);
-  Hw.pair (MSt.pack st) (Hw.pair (PhyIn.pack (PhyIn.mk (Model.raw mp s) U.hi (Hw.lit 2 0) (Hw.lit 16 0)))
+    (Hw.mux d.dlyLd d.tap0 s.tap0) (Hw.mux d.dlyLd d.tap1 s.tap1)
+    (Hw.mux mprSet (U.bit d.a 2) s.mprEn);
+  -- DQS is a diagnostic here: it is high while a read burst is out (the PHY does not
+  -- capture it, but the board's S probe does)
+  let dqsNow := Hw.cat (Hw.fst outNext) (Hw.fst outNext);
+  Hw.pair (MSt.pack st) (Hw.pair (PhyIn.pack (PhyIn.mk (Model.raw mp s) U.hi dqsNow
+      (Hw.mux (Hw.fst outNext) (Hw.lit 16 43690) (Hw.lit 16 0))))
     (Viol.pack (Viol.mk s.err s.ecode s.at s.refs s.writes s.reads)))
 
 def Model.bank0 : HwTy.El Bank.code :=
@@ -252,7 +264,8 @@ def Model.init : HwTy.El MSt.code :=
     (BitVec.ofNat 16 0) (BitVec.ofNat 16 0) (BitVec.ofNat 16 0)
     (BitVec.ofNat 24 0) (BitVec.ofNat 1 0) (BitVec.ofNat 24 0) (BitVec.ofNat 1 0) (BitVec.ofNat 1 0)
     (Model.pipe0, (Model.pipe0, (Model.pipe0, (Model.pipe0, (Model.pipe0, (Model.pipe0, (Model.pipe0, Model.pipe0)))))))
-    (BitVec.ofNat 1 0) (BitVec.ofNat 128 0) (BitVec.ofNat 1 0) (BitVec.ofNat 128 0) (BitVec.ofNat 5 0) (BitVec.ofNat 5 0))
+    (BitVec.ofNat 1 0) (BitVec.ofNat 128 0) (BitVec.ofNat 1 0) (BitVec.ofNat 128 0) (BitVec.ofNat 5 0) (BitVec.ofNat 5 0)
+    (BitVec.ofNat 1 0))
 
 def Model.circuit (t : Timing) (mp : MParams) : Circuit Dfi.code (HwTy.prod PhyIn.code Viol.code) :=
   Circuit.mk MSt.code Model.init (fun s d => Model.step t mp (MSt.unpack s) (Dfi.unpack d))

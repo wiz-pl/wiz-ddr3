@@ -89,7 +89,9 @@ structure PhyIn (r : HwTy → Type) where
 
 structure St (r : HwTy → Type) where
   -- initialisation
-  phase : r (B 3)       -- 0 reset, 1 CKE low, 2 tXPR, 3 MRS, 4 ZQ, 5 calibration, 6 service
+  phase : r (B 4)       -- 0 reset, 1 CKE low, 2 tXPR, 3 MRS, 4 ZQ, 5 calibration,
+                        -- 6 service, 7 MPR on, 8 MPR read sweep, 9 MPR off (MRS),
+                        -- 10 MPR off settle (tMOD)
   timer : r (B 16)
   step : r (B 2)
   rstN : r Bit
@@ -150,6 +152,15 @@ structure St (r : HwTy → Type) where
   dlyLd : r Bit
   cw : r (B 4)          -- the write shift being tried, in half memory clocks (4: none)
   ctry : r (B 4)        -- shifts tried
+  -- the MPR pass (a diagnostic: read-only, no ACT/PRE/REF, MR3 A2 on)
+  xDone : r Bit         -- the MPR sweep has run
+  xFail : r Bit         -- and found no usable (slip, tap) run
+  xm0 : r (B 256)       -- its (slip, tap) map, as map0/map1 are for the written pattern
+  xm1 : r (B 256)
+  nm0 : r (B 256)       -- the written-pattern maps, saved while the MPR pass uses map0/map1
+  nm1 : r (B 256)
+  xro : r (B 128)       -- every ISERDES bit seen high during the MPR reads
+  xra : r (B 128)       -- every ISERDES bit never seen low
   deriving Bundle
 
 ------------------------------------------------------------------------------------
@@ -173,6 +184,17 @@ def Pat.sumBits : Nat → (Nat → Nat) → Nat → Nat
 def Pat.burst : Nat := Pat.sumBits 128 Pat.burstBit 0
 -- a lane's 64 bits after alignment: bit b*8 + i
 def Pat.laneWord (l : Nat) : Nat := Pat.sumBits 64 (fun (p : Nat) => Pat.bitOf (Pat.byte l (Nat.div p 8)) (Nat.mod p 8)) 0
+
+-- The MPR pattern (MR3 A2 = 1, A1:A0 = 00): the DRAM returns 01010101 on every DQ,
+-- i.e. beat b is b mod 2 (Micron's calibration_pattern = 8'b10101010, bit 0 first).
+-- This does not depend on what was written (writes are ignored in MPR mode), so a read
+-- through it checks the read path alone. Bit b*16 + j is beat b on DQ j.
+def Pat.mprBurst : Nat := Pat.sumBits 128 (fun (p : Nat) => Nat.mod (Nat.div p 16) 2) 0
+-- the same after a lane's alignment: bit b*8 + i is beat b on DQ i
+def Pat.mprLaneWord : Nat := Pat.sumBits 64 (fun (p : Nat) => Nat.mod (Nat.div p 8) 2) 0
+
+-- is MR3's A2 (multipurpose register enable) set?
+def Timing.mprOn (t : Timing) : Bool := Nat.beq (Nat.mod (Nat.div t.mr3 4) 2) 1
 
 ------------------------------------------------------------------------------------
 -- Read alignment: DQ j's 16 samples are the previous word's 8 then this word's 8; slip
@@ -290,30 +312,54 @@ def Sched.step {r : HwTy → Type} [Hw r] (t : Timing) (s : St r) (on : r Bit) (
 
 structure InitNext (r : HwTy → Type) where
   cmd : Cmd r
-  phase : r (B 3)
+  phase : r (B 4)
   timer : r (B 16)
   step : r (B 2)
   rstN : r Bit
   cke : r Bit
 
-def Init.step {r : HwTy → Type} [Hw r] (t : Timing) (s : St r) (calEnd : r Bit) : InitNext r :=
+-- `train` adds an MPR pass after the written-pattern calibration; `mprOnly` skips the
+-- written pattern and goes straight to the MPR pass (a read-path-only diagnostic build).
+def Init.step {r : HwTy → Type} [Hw r] (t : Timing) (train mprOnly : Bool) (s : St r)
+    (calEnd mprEnd : r Bit) : InitNext r :=
   let tz := U.isZero s.timer;
   let p0 := U.band (U.isLit s.phase 0) tz;
   let p1 := U.band (U.isLit s.phase 1) tz;
   let p2 := U.band (U.isLit s.phase 2) tz;
   let p3 := U.band (U.isLit s.phase 3) tz;
   let p4 := U.band (U.isLit s.phase 4) tz;
+  let p7 := U.band (U.isLit s.phase 7) tz;
+  let p9 := U.band (U.isLit s.phase 9) tz;
+  let p10 := U.band (U.isLit s.phase 10) tz;
   let st0 := U.band p3 (U.isLit s.step 0);
   let st1 := U.band p3 (U.isLit s.step 1);
   let st2 := U.band p3 (U.isLit s.step 2);
   let st3 := U.band p3 (U.isLit s.step 3);
   let cmd := Cmd.choose p2 (Cmd.mrs 2 t.mr2) (Cmd.choose st0 (Cmd.mrs 3 t.mr3) (Cmd.choose st1 (Cmd.mrs 1 t.mr1)
-    (Cmd.choose st2 (Cmd.mrs 0 t.mr0) (Cmd.choose st3 Cmd.zqcl Cmd.nop))));
-  let phase := Hw.mux p0 (Hw.lit 3 1) (Hw.mux p1 (Hw.lit 3 2) (Hw.mux p2 (Hw.lit 3 3) (Hw.mux st3 (Hw.lit 3 4)
-    (Hw.mux p4 (Hw.lit 3 5) (Hw.mux calEnd (Hw.lit 3 6) s.phase)))));
+    (Cmd.choose st2 (Cmd.mrs 0 t.mr0) (Cmd.choose st3 Cmd.zqcl (Cmd.choose p7 (Cmd.mrs 3 4)
+    (Cmd.choose p9 (Cmd.mrs 3 (match mprOnly with
+      | .true => 0
+      | .false => t.mr3)) Cmd.nop))))));
+  let afterP4 : r (B 4) := match mprOnly with
+    | .true => Hw.lit 4 7
+    | .false => Hw.lit 4 5;
+  let afterCal : r (B 4) := match train with
+    | .true => Hw.lit 4 7
+    | .false => Hw.lit 4 6;
+  let p4to7 : r Bit := match mprOnly with
+    | .true => p4
+    | .false => U.lo;
+  let calTo7 : r Bit := match train with
+    | .true => calEnd
+    | .false => U.lo;
+  let enter7 := U.bor p4to7 calTo7;
+  let phase := Hw.mux p0 (Hw.lit 4 1) (Hw.mux p1 (Hw.lit 4 2) (Hw.mux p2 (Hw.lit 4 3) (Hw.mux st3 (Hw.lit 4 4)
+    (Hw.mux p4 afterP4 (Hw.mux p7 (Hw.lit 4 8) (Hw.mux mprEnd (Hw.lit 4 9)
+    (Hw.mux p9 (Hw.lit 4 10) (Hw.mux p10 (Hw.lit 4 6) (Hw.mux calEnd afterCal s.phase)))))))));
   let timer := Hw.mux p0 (Gap.lit t.tCke) (Hw.mux p1 (Gap.lit t.tXPR) (Hw.mux p2 (Gap.lit t.tMRD)
     (Hw.mux (Hw.or st0 st1) (Gap.lit t.tMRD) (Hw.mux st2 (Gap.lit t.tMOD) (Hw.mux st3 (Gap.lit t.tZQinit)
-    (U.down s.timer))))));
+    (Hw.mux enter7 (Gap.lit t.tMRD) (Hw.mux mprEnd (Gap.lit (U.max t.tMRD t.tMOD))
+    (Hw.mux p9 (Gap.lit t.tMOD) (U.down s.timer)))))))));
   let step := Hw.mux p2 (Hw.lit 2 0) (Hw.mux p3 (U.inc s.step) s.step);
   InitNext.mk cmd phase timer step (Hw.or s.rstN p0) (Hw.or s.cke p1)
 
@@ -353,6 +399,9 @@ structure CalNext (r : HwTy → Type) where
   calFail : r Bit
   dlyLd : r Bit
   finished : r Bit
+  watch : r Bit        -- this cycle is in the watch window (raw may be compared)
+  store : r Bit        -- this cycle stores the tap's hit map
+  cmd : Cmd r          -- the MPR pass's own read commands (NOP for the written pattern)
 
 -- the map after a read at tap `tap`: bit s*32 + tap is whether slip s matched
 def Cal.store {r : HwTy → Type} [Hw r] (m : r (B 256)) (tap : r (B 5)) (hits : r (B 8)) : r (B 256) :=
@@ -382,7 +431,10 @@ def Cal.scan {r : HwTy → Type} [Hw r] (m : r (B 256)) (pos : r (B 8)) (x : Run
   let better := Hw.ult x.bl rl;
   Run.mk rs rl (Hw.mux better rs x.bs) (Hw.mux better rl x.bl) (Hw.mux better (Hw.slice 5 3 pos) x.bp)
 
-def Cal.step {r : HwTy → Type} [Hw r] (s : St r) (on : r Bit) (accept : r Bit) (sIdle : r Bit) (raw : r (B 128)) : CalNext r :=
+-- `mpr` selects the MPR pass: no write (the DRAM ignores them), a read every cycle
+-- (no ACT/PRE: MPR reads need no open page), and the expected 0101… word. The written
+-- pattern's pass uses the scheduler as before.
+def Cal.step {r : HwTy → Type} [Hw r] (s : St r) (on : r Bit) (accept : r Bit) (sIdle : r Bit) (raw : r (B 128)) (mpr : r Bit) : CalNext r :=
   let c0 := U.band on (U.isLit s.cst 0);
   let c1 := U.band on (U.isLit s.cst 1);
   let c2 := U.band on (U.isLit s.cst 2);
@@ -392,11 +444,14 @@ def Cal.step {r : HwTy → Type} [Hw r] (s : St r) (on : r Bit) (accept : r Bit)
   let c6 := U.band on (U.isLit s.cst 6);
   let c7 := U.band on (U.isLit s.cst 7);
   let wz := U.isZero s.cwin;
-  let req := Req.mk (U.bor c0 c3) c0 (Hw.lit 24 0) (Hw.lit 128 Pat.burst) (Hw.lit 16 0);
+  let nmpr := U.bnot mpr;
+  let req := Req.mk (U.band (U.bor c0 c3) nmpr) (U.band c0 nmpr) (Hw.lit 24 0) (Hw.lit 128 Pat.burst) (Hw.lit 16 0);
   -- 0: write the pattern; 1: wait for the scheduler; 2: set the tap, wait 16 cycles;
   -- 3: read; 4: watch 40 cycles; 5: store, next tap; 6: scan 256 positions; 7: done
-  let m0 := Al.matches s.prevRaw raw 0;
-  let m1 := Al.matches s.prevRaw raw 1;
+  let w0 : r (B 64) := Hw.mux mpr (Hw.lit 64 Pat.mprLaneWord) (Hw.lit 64 (Pat.laneWord 0));
+  let w1 : r (B 64) := Hw.mux mpr (Hw.lit 64 Pat.mprLaneWord) (Hw.lit 64 (Pat.laneWord 1));
+  let m0 := U.ofBits (fun (sl : Nat) => Hw.eq (Al.lane s.prevRaw raw 0 sl) w0) 8;
+  let m1 := U.ofBits (fun (sl : Nat) => Hw.eq (Al.lane s.prevRaw raw 1 sl) w1) 8;
   let k := Al.encode s.rdHist 32;
   let watching := U.band c4 (U.bnot wz);
   let hits0 := Hw.mux c3 (Hw.lit 8 0) (Hw.mux watching (Hw.or s.hits0 m0) s.hits0);
@@ -404,13 +459,20 @@ def Cal.step {r : HwTy → Type} [Hw r] (s : St r) (on : r Bit) (accept : r Bit)
   let lat0 := Hw.mux watching (Cal.lats s.lat0 s.hits0 m0 k) s.lat0;
   let lat1 := Hw.mux watching (Cal.lats s.lat1 s.hits1 m1 k) s.lat1;
   let lastTap := U.isLit s.ctap 31;
-  let cst := Hw.mux (U.band c0 accept) (Hw.lit 3 1) (Hw.mux (U.band c1 sIdle) (Hw.lit 3 2)
-    (Hw.mux (U.band c2 wz) (Hw.lit 3 3) (Hw.mux (U.band c3 accept) (Hw.lit 3 4)
+  let c0go := U.bor (U.band c0 accept) (U.band c0 mpr);
+  let c3go := U.bor (U.band c3 accept) (U.band c3 mpr);
+  let cst := Hw.mux c0go (Hw.mux mpr (Hw.lit 3 2) (Hw.lit 3 1)) (Hw.mux (U.band c1 sIdle) (Hw.lit 3 2)
+    (Hw.mux (U.band c2 wz) (Hw.lit 3 3) (Hw.mux c3go (Hw.lit 3 4)
     (Hw.mux (U.band c4 wz) (Hw.lit 3 5) (Hw.mux c5 (Hw.mux lastTap (Hw.lit 3 6) (Hw.lit 3 2))
     (Hw.mux (U.band c6 (U.isLit s.cpos 255)) (Hw.lit 3 7) s.cst))))));
-  let cwin := Hw.mux (U.band c1 sIdle) (Hw.lit 6 16) (Hw.mux c5 (Hw.lit 6 16) (Hw.mux (U.band c3 accept) (Hw.lit 6 40)
+  let cwin := Hw.mux (U.bor (U.band c1 sIdle) c0go) (Hw.lit 6 16) (Hw.mux c5 (Hw.lit 6 16) (Hw.mux c3go (Hw.lit 6 40)
     (U.down s.cwin)));
   let ctap := Hw.mux c5 (U.inc s.ctap) s.ctap;
+  let rdCmd : Cmd r := Cmd.rd (Hw.lit 3 0) (Hw.lit 7 0);
+  let nopCmd : Cmd r := Cmd.nop;
+  -- (one read per tap: 40 cycles of watch still cover the longest read latency, and
+  -- the read-history bit gives the latency)
+  let cmd : Cmd r := Cmd.choose mpr (Cmd.choose c3 rdCmd nopCmd) nopCmd;
   let r0 := Cal.scan s.map0 s.cpos (Run.mk s.run0s s.run0l s.best0s s.best0l s.best0p);
   let r1 := Cal.scan s.map1 s.cpos (Run.mk s.run1s s.run1l s.best1s s.best1l s.best1p);
   -- the results: the middle of the best run
@@ -434,7 +496,7 @@ def Cal.step {r : HwTy → Type} [Hw r] (s : St r) (on : r Bit) (accept : r Bit)
     (Hw.mux c7 (Hw.mux fail (Hw.lit 5 16) tap0) s.tap0) (Hw.mux c7 (Hw.mux fail (Hw.lit 5 16) tap1) s.tap1) (Hw.mux c7 lmax s.latR)
     (Hw.mux c7 (Hw.and late1 (U.isLit diff 1)) s.dly0) (Hw.mux c7 (Hw.and (U.bnot late1) (U.isLit diff 1)) s.dly1)
     (Hw.or s.calDone c7) (Hw.mux c7 fail s.calFail)
-    (Hw.or c7 (U.band c2 (U.isLit s.cwin 8))) c7
+    (Hw.or c7 (U.band c2 (U.isLit s.cwin 8))) c7 watching c5 cmd
 
 ------------------------------------------------------------------------------------
 -- Write serialisation with a shift: a stream of 24 samples over three cycles (m = 0, 1, 2),
@@ -462,10 +524,20 @@ def Ser.dqs {r : HwTy → Type} [Hw r] (b : Nat) : r Bit := match Nat.beq (Nat.m
 ------------------------------------------------------------------------------------
 -- The whole step.
 
-def Ctrl.step {r : HwTy → Type} [Hw r] (t : Timing) (s : St r) (p : PortIn r) (phy : PhyIn r) : r (HwTy.prod St.code (HwTy.prod PortOut.code Dfi.code)) :=
-  let calOn := U.isLit s.phase 5;
+def Ctrl.stepWith {r : HwTy → Type} [Hw r] (t : Timing) (train mprOnly : Bool) (s : St r) (p : PortIn r) (phy : PhyIn r) : r (HwTy.prod St.code (HwTy.prod PortOut.code Dfi.code)) :=
+  let calNorm := U.isLit s.phase 5;
+  let calMpr := U.isLit s.phase 8;
+  let calOn := U.bor calNorm calMpr;
+  -- the IDELAY follows the sweep tap while either calibration pass runs, and the
+  -- chosen tap afterwards (the train build has calDone set before the MPR pass)
+  let calTap := calOn;
   let svc := U.isLit s.phase 6;
-  let schedOn := U.bor calOn svc;
+  -- the MPR pass does not use the scheduler (no ACT/PRE/REF), so it is not `schedOn`
+  let schedOn := U.bor calNorm svc;
+  let mprStart := U.band (U.isLit s.phase 7) (U.isZero s.timer);
+  let mprOnlyB : r Bit := match mprOnly with
+    | .true => U.hi
+    | .false => U.lo;
   let sIdle := U.band (U.isLit s.sst 0) (U.bnot s.refPend);
   let ready := U.band svc sIdle;
   -- the request: the port's in service, calibration's while calibrating (calibration
@@ -480,11 +552,18 @@ def Ctrl.step {r : HwTy → Type} [Hw r] (t : Timing) (s : St r) (p : PortIn r) 
   let q := Req.mk (Hw.mux calOn calReq.valid portReq.valid) (Hw.mux calOn calReq.we portReq.we)
     (Hw.mux calOn calReq.addr portReq.addr) (Hw.mux calOn calReq.wdata portReq.wdata) (Hw.mux calOn calReq.wdm portReq.wdm);
   let sn := Sched.step t s schedOn refDue q;
-  let cn := Cal.step s (U.band calOn phy.rdy) sn.accept sIdle phy.raw;
-  -- a failed calibration tries the next write shift (up to nine), from the start
-  let retry := U.band cn.finished (U.band cn.calFail (Hw.ult s.ctry (Hw.lit 4 8)));
-  let ini := Init.step t s (U.band cn.finished (U.bnot retry));
-  let cmd := Cmd.choose schedOn sn.cmd ini.cmd;
+  let cn := Cal.step s (U.band calOn phy.rdy) sn.accept sIdle phy.raw calMpr;
+  let calEnd := U.band calNorm cn.finished;
+  let mprEnd := U.band calMpr cn.finished;
+  -- a failed written-pattern calibration tries the next write shift (up to nine), from
+  -- the start; the MPR pass does not retry (there is no write to shift)
+  let retry := U.band calEnd (U.band cn.calFail (Hw.ult s.ctry (Hw.lit 4 8)));
+  let ini := Init.step t train mprOnly s (U.band calEnd (U.bnot retry)) mprEnd;
+  let cmd := Cmd.choose calMpr cn.cmd (Cmd.choose schedOn sn.cmd ini.cmd);
+  -- the MPR pass starts from a clean calibration state; its results are kept in xm0/xm1
+  let rst := mprStart;
+  let setX := U.band mprEnd mprOnlyB;
+  let keepCal := U.band calMpr (U.bnot mprOnlyB);
   let rdNow := U.band (U.band s.ras (U.bnot s.cas)) s.wen;
   let wrNow := U.band (U.band s.ras (U.bnot s.cas)) (U.bnot s.wen);
   let wrHist := Hw.slice 0 6 (Hw.cat (Hw.slice 0 5 s.wrHist) wrNow);
@@ -514,30 +593,78 @@ def Ctrl.step {r : HwTy → Type} [Hw r] (t : Timing) (s : St r) (p : PortIn r) 
   let dfi := Dfi.mk s.ras s.cas s.wen s.ba s.a s.cke (Hw.or (Hw.or wrNow (Hw.slice 0 1 s.wrHist)) (Hw.or (U.bit s.wrHist 1) (U.bit s.wrHist 2)))
     s.rstN s.wdata s.wdm wData
     (Hw.or (U.bit s.wrHist (t.wrLatency - 2)) (Hw.or wData (U.bit s.wrHist t.wrLatency))) wData
-    s.dlyLd (Hw.mux s.calDone s.tap0 s.ctap) (Hw.mux s.calDone s.tap1 s.ctap) serDq serDm serDqs serOe serDqsOe;
-  let out := PortOut.mk ready rvalid rdata s.calDone s.calFail s.tap0 s.tap1 s.slip0 s.slip1 s.latR s.map0 s.map1 s.cw;
+    s.dlyLd (Hw.mux calTap s.ctap s.tap0) (Hw.mux calTap s.ctap s.tap1) serDq serDm serDqs serOe serDqsOe;
+  -- (an MPR-only build's results are what the port reports)
+  let out := PortOut.mk ready rvalid rdata
+    (Hw.mux setX cn.calDone s.calDone) (Hw.mux setX cn.calFail s.calFail)
+    (Hw.mux setX cn.tap0 s.tap0) (Hw.mux setX cn.tap1 s.tap1)
+    (Hw.mux setX cn.slip0 s.slip0) (Hw.mux setX cn.slip1 s.slip1)
+    (Hw.mux setX cn.latR s.latR)
+    (Hw.mux mprOnlyB s.xm0 s.map0) (Hw.mux mprOnlyB s.xm1 s.map1) s.cw;
   let st := St.mk ini.phase ini.timer ini.step ini.rstN ini.cke cmd.ras cmd.cas cmd.wen cmd.ba cmd.a
     sn.sst sn.stimer sn.swe sn.sba sn.srow sn.scol sn.wdata sn.wdm refCnt sn.refPend wrHist rdHist
     phy.raw al0 al1
-    (Hw.mux retry (Hw.lit 3 0) cn.cst) (Hw.mux retry (Hw.lit 5 0) cn.ctap) cn.cwin cn.hits0 cn.hits1 cn.lat0 cn.lat1
-    (Hw.mux retry (Hw.lit 256 0) cn.map0) (Hw.mux retry (Hw.lit 256 0) cn.map1) (Hw.mux retry (Hw.lit 8 0) cn.cpos)
-    cn.run0s cn.run0l cn.run1s cn.run1l cn.best0s (Hw.mux retry (Hw.lit 6 0) cn.best0l) cn.best0p
-    cn.best1s (Hw.mux retry (Hw.lit 6 0) cn.best1l) cn.best1p
-    cn.slip0 cn.slip1 cn.tap0 cn.tap1 cn.latR cn.dly0 cn.dly1 (Hw.mux retry U.lo cn.calDone) (Hw.mux retry U.lo cn.calFail) cn.dlyLd
-    (Hw.mux retry (Hw.mux (U.isLit s.cw 8) (Hw.lit 4 0) (U.inc s.cw)) s.cw) (Hw.mux retry (U.inc s.ctry) s.ctry);
+    (Hw.mux rst (Hw.lit 3 0) (Hw.mux retry (Hw.lit 3 0) cn.cst))
+    (Hw.mux rst (Hw.lit 5 0) (Hw.mux retry (Hw.lit 5 0) cn.ctap))
+    (Hw.mux rst (Hw.lit 6 0) cn.cwin)
+    (Hw.mux rst (Hw.lit 8 0) cn.hits0) (Hw.mux rst (Hw.lit 8 0) cn.hits1)
+    (Hw.mux rst (Hw.lit 40 0) cn.lat0) (Hw.mux rst (Hw.lit 40 0) cn.lat1)
+    (Hw.mux rst (Hw.lit 256 0) (Hw.mux mprEnd (Hw.mux mprOnlyB cn.map0 s.nm0) (Hw.mux retry (Hw.lit 256 0) cn.map0)))
+    (Hw.mux rst (Hw.lit 256 0) (Hw.mux mprEnd (Hw.mux mprOnlyB cn.map1 s.nm1) (Hw.mux retry (Hw.lit 256 0) cn.map1)))
+    (Hw.mux rst (Hw.lit 8 0) (Hw.mux retry (Hw.lit 8 0) cn.cpos))
+    (Hw.mux rst (Hw.lit 5 0) cn.run0s) (Hw.mux rst (Hw.lit 6 0) cn.run0l)
+    (Hw.mux rst (Hw.lit 5 0) cn.run1s) (Hw.mux rst (Hw.lit 6 0) cn.run1l)
+    (Hw.mux rst (Hw.lit 5 0) cn.best0s) (Hw.mux rst (Hw.lit 6 0) (Hw.mux retry (Hw.lit 6 0) cn.best0l))
+    (Hw.mux rst (Hw.lit 3 0) cn.best0p)
+    (Hw.mux rst (Hw.lit 5 0) cn.best1s) (Hw.mux rst (Hw.lit 6 0) (Hw.mux retry (Hw.lit 6 0) cn.best1l))
+    (Hw.mux rst (Hw.lit 3 0) cn.best1p)
+    (Hw.mux keepCal s.slip0 cn.slip0) (Hw.mux keepCal s.slip1 cn.slip1)
+    (Hw.mux keepCal s.tap0 (Hw.mux setX cn.tap0 cn.tap0))
+    (Hw.mux keepCal s.tap1 (Hw.mux setX cn.tap1 cn.tap1))
+    (Hw.mux keepCal s.latR (Hw.mux setX cn.latR cn.latR))
+    (Hw.mux keepCal s.dly0 cn.dly0) (Hw.mux keepCal s.dly1 cn.dly1)
+    (Hw.mux keepCal s.calDone (Hw.mux setX cn.calDone (Hw.mux retry U.lo cn.calDone)))
+    (Hw.mux keepCal s.calFail (Hw.mux setX cn.calFail (Hw.mux retry U.lo cn.calFail))) cn.dlyLd
+    (Hw.mux retry (Hw.mux (U.isLit s.cw 8) (Hw.lit 4 0) (U.inc s.cw)) s.cw)
+    (Hw.mux retry (U.inc s.ctry) s.ctry)
+    (Hw.mux rst U.lo (Hw.or s.xDone mprEnd))
+    (Hw.mux rst U.lo (Hw.mux mprEnd cn.calFail s.xFail))
+    (Hw.mux mprEnd cn.map0 (Hw.mux rst (Hw.lit 256 0) s.xm0))
+    (Hw.mux mprEnd cn.map1 (Hw.mux rst (Hw.lit 256 0) s.xm1))
+    (Hw.mux rst s.map0 s.nm0)
+    (Hw.mux rst s.map1 s.nm1)
+    (Hw.mux rst (Hw.lit 128 0) (Hw.mux (U.band calMpr cn.watch) (Hw.or s.xro phy.raw) s.xro))
+    (Hw.mux rst (Hw.lit 128 (Nat.pow 2 128 - 1)) (Hw.mux (U.band calMpr cn.watch) (Hw.and s.xra phy.raw) s.xra));
   Hw.pair (St.pack st) (Hw.pair (PortOut.pack out) (Dfi.pack dfi))
 
 -- the initial state: everything 0 but the init timer, the command (a NOP) and the
 -- refresh counter
 def Z (n : Nat) : HwTy.El (B n) := BitVec.ofNat n 0
 def Ctrl.init (t : Timing) : HwTy.El St.code :=
-  Bundle.toEl St.bundle (St.mk (Z 3) (BitVec.ofNat 16 (t.tReset - 1)) (Z 2) (Z 1) (Z 1)
+  Bundle.toEl St.bundle (St.mk (Z 4) (BitVec.ofNat 16 (t.tReset - 1)) (Z 2) (Z 1) (Z 1)
     (BitVec.ofNat 1 1) (BitVec.ofNat 1 1) (BitVec.ofNat 1 1) (Z 3) (Z 14)
     (Z 2) (Z 8) (Z 1) (Z 3) (Z 14) (Z 7) (Z 128) (Z 16) (BitVec.ofNat 12 (t.tREFI - 1)) (Z 1) (Z 6) (Z 32)
     (Z 128) (Z 64) (Z 64)
     (Z 3) (Z 5) (Z 6) (Z 8) (Z 8) (Z 40) (Z 40) (Z 256) (Z 256) (Z 8)
     (Z 5) (Z 6) (Z 5) (Z 6) (Z 5) (Z 6) (Z 3) (Z 5) (Z 6) (Z 3)
-    (Z 3) (Z 3) (Z 5) (Z 5) (Z 5) (Z 1) (Z 1) (Z 1) (Z 1) (Z 1) (BitVec.ofNat 4 4) (Z 4))
+    (Z 3) (Z 3) (Z 5) (Z 5) (Z 5) (Z 1) (Z 1) (Z 1) (Z 1) (Z 1) (BitVec.ofNat 4 4) (Z 4)
+    (Z 1) (Z 1) (Z 256) (Z 256) (Z 256) (Z 256) (Z 128) (Z 128))
+
+def Ctrl.step {r : HwTy → Type} [Hw r] (t : Timing) (s : St r) (p : PortIn r) (phy : PhyIn r) : r (HwTy.prod St.code (HwTy.prod PortOut.code Dfi.code)) :=
+  Ctrl.stepWith t .false .false s p phy
+
+def Ctrl.circuitWith (t : Timing) (train mprOnly : Bool) : Circuit (HwTy.prod PortIn.code PhyIn.code) (HwTy.prod PortOut.code Dfi.code) :=
+  Circuit.mk St.code (Ctrl.init t) (fun s x => Ctrl.stepWith t train mprOnly (St.unpack s) (PortIn.unpack (Hw.fst x)) (PhyIn.unpack (Hw.snd x)))
 
 def Ctrl.circuit (t : Timing) : Circuit (HwTy.prod PortIn.code PhyIn.code) (HwTy.prod PortOut.code Dfi.code) :=
-  Circuit.mk St.code (Ctrl.init t) (fun s x => Ctrl.step t (St.unpack s) (PortIn.unpack (Hw.fst x)) (PhyIn.unpack (Hw.snd x)))
+  Ctrl.circuitWith t .false .false
+
+-- the diagnostic variant: written-pattern calibration, then an MPR read sweep
+def Ctrl.circuitTrain (t : Timing) : Circuit (HwTy.prod PortIn.code PhyIn.code) (HwTy.prod PortOut.code Dfi.code) :=
+  Ctrl.circuitWith t .true .false
+
+-- the read-path-only variant: the MPR sweep instead of the written pattern. The MPR
+-- pass enters MPR (MR3 A2) and leaves it before service, so a normal timing record (MR3
+-- A2 clear) is right; service is normal memory.
+def Ctrl.circuitMpr (t : Timing) : Circuit (HwTy.prod PortIn.code PhyIn.code) (HwTy.prod PortOut.code Dfi.code) :=
+  Ctrl.circuitWith t .true .true

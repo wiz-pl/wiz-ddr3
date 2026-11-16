@@ -164,3 +164,27 @@ sweeps a write shift in half memory clocks (9 tries) and prints the one it kept 
   pattern when it was read back. Probably the first write after the dump; not chased.
 * Bandwidth: 0x1563559A = 358.8 M cycles at 100 MHz = 3.59 s to write and read 2 × 256 MB,
   i.e. about 150 MB/s for the closed-page controller (one access at a time).
+
+## MPR mode as a pass in the controller (2026-11-14)
+
+The earlier MPR build only set MR3 = 4 in the init record, so the read sweep still
+compared against the written pattern and the controller stayed in MPR afterwards. MPR is
+now a proper pass inside `Ctrl` (new phases 7–10):
+
+* **Enter**: MRS MR3 = 4 (A2), tMRD. **Sweep**: for each IDELAY tap, one `RD` (no `ACT`,
+  no `PRE`: MPR reads need no open page), compare the raw word at all eight slips
+  against the MPR word `01010101` per DQ, for 40 cycles. **Leave**: MRS MR3 = `t.mr3`,
+  then tMOD before service. Refresh is disabled while MPR is on (the DRAM forbids REF
+  then), which is safe because the sweep is ~2.2k cycles < 9 × tREFI.
+* The pass keeps its own map (`St.xm0/xm1`) and the DQ OR/AND (`St.xro/xra`), so the
+  written-pattern result is not overwritten. In `Ctrl.circuitMpr` the written pass is
+  skipped and the MPR result is the one on `PortOut`.
+* The 0101 pattern is invariant under a two-bit shift (slip parity) and under DQ
+  inversion up to a shift, so MPR finds the **tap window** and proves the read path
+  toggles, but the written pattern (or the parity half of the MPR map) is still needed
+  for the exact slip. That is the read/write split: a good `X0/X1` run with a failing
+  `M0/M1` puts the fault in the write path (DQS, CK, write shift), not in sampling.
+* The model now implements MPR (`mprEn` from MR3 A2, pattern data, no bank needed,
+  writes ignored) and the simulation harnesses are `ddr3 simtrain` (written + MPR +
+  traffic), `ddr3 mprsim` (MPR only) and `ddr3 sweep` (tap/slip table for several
+  modelled latencies/offsets/tap windows). Results are in the next section.

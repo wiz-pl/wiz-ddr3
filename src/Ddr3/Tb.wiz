@@ -25,6 +25,8 @@ structure Gen (r : HwTy → Type) where
   badGot : r (B 128)
   badExp : r (B 128)
   serBad : r (B 16)     -- cycles where the serialised write data is not the burst
+  dqsOr : r (B 2)       -- DQS input buffers ever high, never low (a diagnostic)
+  dqsAnd : r (B 2)
   deriving Bundle
 
 structure TbSt (r : HwTy → Type) where
@@ -56,6 +58,16 @@ structure TbOut (r : HwTy → Type) where
   badGot : r (B 128)
   badExp : r (B 128)
   serBad : r (B 16)
+  map0 : r (B 256)      -- the written-pattern (slip, tap) maps, as the port reports them
+  map1 : r (B 256)
+  xDone : r Bit         -- the MPR pass ran, and its (slip, tap) maps
+  xFail : r Bit
+  xm0 : r (B 256)
+  xm1 : r (B 256)
+  xro : r (B 128)       -- every DQ bit seen high in the MPR reads, and never low
+  xra : r (B 128)
+  dqsOr : r (B 2)
+  dqsAnd : r (B 2)
   deriving Bundle
 
 -- the burst address of index i: row {1, i5, 0…, i4, i5}, bank i3..i1, column {i0, 0…, i0}
@@ -70,11 +82,16 @@ def Gen.req {r : HwTy → Type} [Hw r] (on : r Bit) (g : Gen r) : PortIn r :=
   PortIn.mk (U.band on (U.bnot g.waiting)) (U.bit g.lfsr 7) (Gen.addr (Hw.slice 8 6 g.lfsr)) (Rnd.data g.lfsr)
     (Hw.slice 16 16 g.lfsr)
 
-def Tb.step {r : HwTy → Type} [Hw r] (t : Timing) (mp : MParams) (s : TbSt r) : r (HwTy.prod TbSt.code TbOut.code) :=
+def Tb.stepWith {r : HwTy → Type} [Hw r] (t : Timing) (mp : MParams) (train mprOnly : Bool) (s : TbSt r) : r (HwTy.prod TbSt.code TbOut.code) :=
   let g := Gen.unpack s.gen;
   let cs := St.unpack s.ctrl;
-  let req := Gen.req cs.calDone g;
-  let co := Ctrl.step t cs req (PhyIn.unpack s.phy);
+  -- only service traffic, and not in the read-path-only build (whose slip parity is
+  -- ambiguous by construction)
+  let traffic : r Bit := match mprOnly with
+    | .true => U.lo
+    | .false => U.band cs.calDone (U.isLit cs.phase 6);
+  let req := Gen.req traffic g;
+  let co := Ctrl.stepWith t train mprOnly cs req (PhyIn.unpack s.phy);
   let po := PortOut.unpack (Hw.fst (Hw.snd co));
   let d := Dfi.unpack (Hw.snd (Hw.snd co));
   let mo := Model.step t mp (MSt.unpack s.model) d;
@@ -98,22 +115,27 @@ def Tb.step {r : HwTy → Type} [Hw r] (t : Timing) (mp : MParams) (s : TbSt r) 
     (U.inc g.cycle) (Hw.mux (U.band accept (U.isZero g.ops)) g.cycle g.firstOp)
     (Hw.mux rAcc idx g.ridx)
     (Hw.mux first g.cycle g.badAt) (Hw.mux first g.ridx g.badIdx) (Hw.mux first po.rdata g.badGot) (Hw.mux first g.expect g.badExp)
-    (Hw.mux serWrong (U.inc g.serBad) g.serBad);
+    (Hw.mux serWrong (U.inc g.serBad) g.serBad)
+    (Hw.or g.dqsOr (PhyIn.unpack (Hw.fst (Hw.snd mo))).dqs)
+    (Hw.and g.dqsAnd (PhyIn.unpack (Hw.fst (Hw.snd mo))).dqs);
   let st := TbSt.mk (Hw.fst co) (Hw.fst mo) (Hw.fst (Hw.snd mo)) (Gen.pack gn);
   Hw.pair (TbSt.pack st) (TbOut.pack (TbOut.mk po.calDone po.calFail po.tap0 po.tap1 po.slip0 po.slip1 po.lat
-    v.err v.ecode v.at v.refs g.ops g.reads g.bad g.cycle g.firstOp g.badAt g.badIdx g.badGot g.badExp g.serBad))
+    v.err v.ecode v.at v.refs g.ops g.reads g.bad g.cycle g.firstOp g.badAt g.badIdx g.badGot g.badExp g.serBad
+    cs.map0 cs.map1 cs.xDone cs.xFail cs.xm0 cs.xm1 cs.xro cs.xra gn.dqsOr gn.dqsAnd))
 
 def Tb.gen0 : HwTy.El Gen.code :=
   Bundle.toEl Gen.bundle (Gen.mk (BitVec.ofNat 32 2463534242) (BitVec.ofNat 1 0) (BitVec.ofNat 128 0)
     (fun (a : BitVec 6) => BitVec.ofNat 128 0) (BitVec.ofNat 16 0) (BitVec.ofNat 16 0) (BitVec.ofNat 16 0)
     (BitVec.ofNat 32 0) (BitVec.ofNat 32 0) (BitVec.ofNat 6 0) (BitVec.ofNat 32 0) (BitVec.ofNat 6 0)
-    (BitVec.ofNat 128 0) (BitVec.ofNat 128 0) (BitVec.ofNat 16 0))
+    (BitVec.ofNat 128 0) (BitVec.ofNat 128 0) (BitVec.ofNat 16 0) (BitVec.ofNat 2 0) (BitVec.ofNat 2 3))
 def Tb.init (t : Timing) : HwTy.El TbSt.code :=
   Bundle.toEl TbSt.bundle (TbSt.mk (Ctrl.init t) Model.init (BitVec.ofNat 128 0, (BitVec.ofNat 1 0, (BitVec.ofNat 2 0, BitVec.ofNat 16 0))) Tb.gen0)
 
 -- no inputs: the generator drives everything
+def Tb.circuitWith (t : Timing) (mp : MParams) (train mprOnly : Bool) : Circuit Bit TbOut.code :=
+  Circuit.mk TbSt.code (Tb.init t) (fun s x => Tb.stepWith t mp train mprOnly (TbSt.unpack s))
 def Tb.circuit (t : Timing) (mp : MParams) : Circuit Bit TbOut.code :=
-  Circuit.mk TbSt.code (Tb.init t) (fun s x => Tb.step t mp (TbSt.unpack s))
+  Tb.circuitWith t mp .false .false
 
 -- a run of `n` cycles; the last output
 def Tb.last {A : Type} (d : A) : List A → A
@@ -123,8 +145,16 @@ def Tb.last {A : Type} (d : A) : List A → A
 def Tb.zeros : Nat → List (HwTy.El Bit)
   | .zero => .nil
   | .succ n => .cons (BitVec.ofNat 1 0) (Tb.zeros n)
+def Tb.runWith (t : Timing) (mp : MParams) (train mprOnly : Bool) (n : Nat) : HwTy.El TbOut.code :=
+  Tb.last (HwTy.unpack TbOut.code 0) (Circuit.run (Tb.circuitWith t mp train mprOnly) (Tb.zeros n))
 def Tb.run (t : Timing) (mp : MParams) (n : Nat) : HwTy.El TbOut.code :=
-  Tb.last (HwTy.unpack TbOut.code 0) (Circuit.run (Tb.circuit t mp) (Tb.zeros n))
+  Tb.runWith t mp .false .false n
+-- written-pattern calibration, then the MPR read sweep, then service
+def Tb.runTrain (t : Timing) (mp : MParams) (n : Nat) : HwTy.El TbOut.code :=
+  Tb.runWith t mp .true .false n
+-- MPR only: no written pattern, the read path alone
+def Tb.runMpr (t : Timing) (mp : MParams) (n : Nat) : HwTy.El TbOut.code :=
+  Tb.runWith t mp .true .true n
 
 -- the default device: latency 6, offset 3, good taps 9..22 and 12..27
 def MParams.default : MParams := MParams.mk 6 3 9 22 12 27

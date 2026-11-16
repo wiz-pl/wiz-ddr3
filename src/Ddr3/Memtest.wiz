@@ -103,11 +103,19 @@ def Mt.data {r : HwTy → Type} [Hw r] (pass : r (B 2)) (a : r (B 24)) (lfsr : r
   Hw.mux (U.isLit pass 0) walk (Hw.mux (U.isLit pass 1) (Hw.cat (Hw.cat a32 a32) (Hw.cat a32 a32)) (Rnd.data lfsr))
 
 -- the step, `ab` the bursts' address bits (24 on the board), `n` cycles per UART bit
-def Mt.step {r : HwTy → Type} [Hw r] (t : Timing) (ab n : Nat) (s : MtSt r) (x : MtIn r) :
+def Mt.step {r : HwTy → Type} [Hw r] (t : Timing) (train mprOnly : Bool) (ab n : Nat) (s : MtSt r) (x : MtIn r) :
     r (HwTy.prod MtSt.code (HwTy.prod Ddr3Pads.code Board.code)) :=
   let cs := St.unpack s.ctrl;
   let phyRst := U.bnot (U.isLit s.rstCnt 255);
-  let testing := U.isLit s.mode 2;
+  -- (an MPR-only build is a read-path test: the calibration report and the D0..DF dump
+  -- are the result; the 256 MB passes would read MPR data and are skipped)
+  let testing : r Bit := match mprOnly with
+    | .true => U.lo
+    | .false => U.isLit s.mode 2;
+  -- (with the MPR pass the report waits for it, so X0/X1 are filled in)
+  let reportReady : r Bit := match train with
+    | .true => U.band cs.calDone cs.xDone
+    | .false => cs.calDone;
   let last := Hw.eq s.addr (Hw.lit 25 (Nat.pow 2 ab));
   let a24 := Hw.slice 0 24 s.addr;
   let wdata := Mt.data s.pass a24 s.lfsr;
@@ -118,7 +126,7 @@ def Mt.step {r : HwTy → Type} [Hw r] (t : Timing) (ab n : Nat) (s : MtSt r) (x
   let req := PortIn.mk (U.bor (U.band testing (U.band (U.bnot last) (U.bnot s.waiting))) (U.bor dWr dRd))
     (U.bor (U.band testing (U.bnot s.reading)) dWr) (Hw.mux dumping (Hw.lit 24 1) a24)
     (Hw.mux dumping (Hw.lit 128 Pat.burst) wdata) (Hw.lit 16 65535);
-  let co := Ctrl.step t cs req (PhyIn.unpack s.phy);
+  let co := Ctrl.stepWith t train mprOnly cs req (PhyIn.unpack s.phy);
   let po := PortOut.unpack (Hw.fst (Hw.snd co));
   let dfi := Dfi.unpack (Hw.snd (Hw.snd co));
   let phy := Phy.io (PhyClk.mk x.sys4x x.sys4xDqs x.ref200) phyRst cs.rstN dfi;
@@ -130,7 +138,7 @@ def Mt.step {r : HwTy → Type} [Hw r] (t : Timing) (ab n : Nat) (s : MtSt r) (x
   let writesEnd := U.band passEnd (U.bnot s.reading);
   let readsEnd := U.band passEnd s.reading;
   let txs := Tx.unpack s.tx;
-  let calMsg := List.append (Pr.str "DDR3 cal done=") (List.append (Pr.hex po.calDone 1) (List.append (Pr.str " fail=") (List.append (Pr.hex po.calFail 1) (List.append (Pr.str " tap0=") (List.append (Pr.hex po.tap0 2) (List.append (Pr.str " slip0=") (List.append (Pr.hex po.slip0 1) (List.append (Pr.str " tap1=") (List.append (Pr.hex po.tap1 2) (List.append (Pr.str " slip1=") (List.append (Pr.hex po.slip1 1) (List.append (Pr.str " lat=") (List.append (Pr.hex po.lat 2) (List.append (Pr.str " w=") (List.append (Pr.hex po.wshift 1) (List.append (Pr.crlf) (List.append (Pr.str "M0 ") (List.append (Pr.hex po.map0 64) (List.append (Pr.crlf) (List.append (Pr.str "M1 ") (List.append (Pr.hex po.map1 64) (List.append (Pr.crlf) (List.append (Pr.str "R1 ") (List.append (Pr.hex s.rawOr 32) (List.append (Pr.crlf) (List.append (Pr.str "R0 ") (List.append (Pr.hex s.rawAnd 32) (List.append (Pr.crlf) (List.append (Pr.str "S ") (List.append (Pr.hex s.dqsOr 1) (List.append (Pr.str " ") (List.append (Pr.hex s.dqsAnd 1) (List.append (Pr.str " rst_n=") (List.append (Pr.hex cs.rstN 1) (List.append (Pr.str " cke=") (List.append (Pr.hex cs.cke 1) (List.append (Pr.str " locked=") (List.append (Pr.hex x.locked 1) (List.append (Pr.str " rstCnt=") (List.append (Pr.hex s.rstCnt 2) (Pr.crlf)))))))))))))))))))))))))))))))))))))))));
+  let calMsg := List.append (Pr.str "DDR3 cal done=") (List.append (Pr.hex po.calDone 1) (List.append (Pr.str " fail=") (List.append (Pr.hex po.calFail 1) (List.append (Pr.str " tap0=") (List.append (Pr.hex po.tap0 2) (List.append (Pr.str " slip0=") (List.append (Pr.hex po.slip0 1) (List.append (Pr.str " tap1=") (List.append (Pr.hex po.tap1 2) (List.append (Pr.str " slip1=") (List.append (Pr.hex po.slip1 1) (List.append (Pr.str " lat=") (List.append (Pr.hex po.lat 2) (List.append (Pr.str " w=") (List.append (Pr.hex po.wshift 1) (List.append (Pr.crlf) (List.append (Pr.str "M0 ") (List.append (Pr.hex po.map0 64) (List.append (Pr.crlf) (List.append (Pr.str "M1 ") (List.append (Pr.hex po.map1 64) (List.append (Pr.crlf) (List.append (Pr.str "X0 ") (List.append (Pr.hex cs.xm0 64) (List.append (Pr.crlf) (List.append (Pr.str "X1 ") (List.append (Pr.hex cs.xm1 64) (List.append (Pr.crlf) (List.append (Pr.str "xd=") (List.append (Pr.hex cs.xDone 1) (List.append (Pr.str " xf=") (List.append (Pr.hex cs.xFail 1) (List.append (Pr.crlf) (List.append (Pr.str "R1 ") (List.append (Pr.hex s.rawOr 32) (List.append (Pr.crlf) (List.append (Pr.str "R0 ") (List.append (Pr.hex s.rawAnd 32) (List.append (Pr.crlf) (List.append (Pr.str "S ") (List.append (Pr.hex s.dqsOr 1) (List.append (Pr.str " ") (List.append (Pr.hex s.dqsAnd 1) (List.append (Pr.str " rst_n=") (List.append (Pr.hex cs.rstN 1) (List.append (Pr.str " cke=") (List.append (Pr.hex cs.cke 1) (List.append (Pr.str " locked=") (List.append (Pr.hex x.locked 1) (List.append (Pr.str " rstCnt=") (List.append (Pr.hex s.rstCnt 2) (Pr.crlf))))))))))))))))))))))))))))))))))))))))))))))))))));
   let passMsg := List.append (Pr.str "P") (List.append (Pr.hex s.pass 1) (List.append (Pr.str " err=") (List.append (Pr.hex s.errs 8)
     (List.append (Pr.str " cyc=") (List.append (Pr.hex s.cycles 8) (List.append (Pr.str " first=") (List.append (Pr.hex s.firstA 6)
     (List.append (Pr.str " got=") (List.append (Pr.hex s.firstG 8) (List.append (Pr.str " exp=") (List.append (Pr.hex s.firstE 8) Pr.crlf)))))))))));
@@ -150,7 +158,7 @@ def Mt.step {r : HwTy → Type} [Hw r] (t : Timing) (ab n : Nat) (s : MtSt r) (x
     (U.band (Hw.ult (Hw.lit 6 17) s.dk) (Hw.ult s.dk (Hw.lit 6 34)));
   let dDone := U.isLit s.dk 34;
   let lastLine := U.isLit s.dline 31;
-  let mode := Hw.mux (U.band (U.isZero s.mode) cs.calDone) (Hw.lit 3 1)
+  let mode := Hw.mux (U.band (U.isZero s.mode) reportReady) (Hw.lit 3 1)
     (Hw.mux (U.band printed (U.isLit s.mode 1)) (Hw.lit 3 4)
     (Hw.mux (U.band dumping dDone) (Hw.lit 3 5)
     (Hw.mux (U.band printed (U.band (U.isLit s.mode 5) lastLine)) (Hw.lit 3 2)

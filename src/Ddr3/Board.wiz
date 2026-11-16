@@ -61,5 +61,17 @@ def Board.portNames (n : Netlist) : List String :=
 
 -- the memory test: 2^ab bursts, n cycles per UART bit (the board: 24 and 866); its
 -- outputs the DDR3 pins and the board's
+-- the diagnostic builds: `train` adds the MPR read sweep after the written-pattern
+-- calibration; `mpr` alone runs only the MPR sweep (the pass enters and leaves MPR
+-- itself, so any normal timing record works)
+def Board.memtestWith (t : Timing) (train mprOnly : Bool) (ab n : Nat) : Circuit MtIn.code (HwTy.prod Ddr3Pads.code Board.code) :=
+  Circuit.mk MtSt.code (Mt.init t) (fun s x => Mt.step t train mprOnly ab n (MtSt.unpack s) (MtIn.unpack x))
+
 def Board.memtestC (t : Timing) (ab n : Nat) : Circuit MtIn.code (HwTy.prod Ddr3Pads.code Board.code) :=
-  Circuit.mk MtSt.code (Mt.init t) (fun s x => Mt.step t ab n (MtSt.unpack s) (MtIn.unpack x))
+  Board.memtestWith t .false .false ab n
+
+def Board.memtestTrainC (t : Timing) (ab n : Nat) : Circuit MtIn.code (HwTy.prod Ddr3Pads.code Board.code) :=
+  Board.memtestWith t .true .false ab n
+
+def Board.memtestMprC (t : Timing) (ab n : Nat) : Circuit MtIn.code (HwTy.prod Ddr3Pads.code Board.code) :=
+  Board.memtestWith t .true .true ab n

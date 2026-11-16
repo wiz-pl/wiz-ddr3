@@ -14,11 +14,18 @@ src/Ddr3/Model.wiz    a behavioural DDR3 device that checks every JEDEC timing c
 src/Ddr3/Tb.wiz       the controller against the model, in lockstep with a reference memory
 src/Ddr3/Memtest.wiz  the board design: memory test over all 256 MB, report over the UART
 src/Ddr3/Board.wiz    the Arty's pins (XDC) and the PLL wrapper
-app/ddr3.wiz          the flow driver: sim, gen, bit
+app/ddr3.wiz          the flow driver: sim/simtrain/mprsim/sweep, gen/gens, bit/bits
+docs/soc-interface.md the stable native-port/training contract (for the SoC agent)
+repro/                build, simulation, sweep and board-bitstream scripts
 ```
 
-Design notes: /workspace/wiz-notes/ddr3-design.md (the pinout, the PHY, the timings, the
-calibration). Findings: FINDINGS.md.
+Design notes: `DESIGN.md` in tree; the long version with the pinout, PHY and timing
+table is /workspace/wiz-notes/ddr3-design.md. Findings: FINDINGS.md.
+
+Diagnostics: `ddr3 simtrain` adds a read-only MPR sweep (MR3 A2) after the normal
+written-pattern calibration; `ddr3 mprsim` builds only the MPR pass; `ddr3 sweep`
+prints the tap/slip table over several modelled devices; `ddr3 bittrain`/`bitmpr`
+make the corresponding board bitstreams.
 
 ## Configuration
 

@@ -82,6 +82,18 @@ def natOf (s : String) : Nat := match String.parseNat s with
   | .some n => n
   | .none => 4000
 
+def hexS (w v : Nat) : String := String.mk (Hdl.hexAux w v .nil)
+-- one map row: slip s's 32 taps, 0..31, '#' good
+def mapRowAux (v s : Nat) : Nat → Nat → String
+  | .zero, _ => ""
+  | .succ k, t => (match Nat.beq (Nat.mod (Nat.shiftRight v (s * 32 + t)) 2) 1 with
+    | .true => "#" <+> mapRowAux v s k (t + 1)
+    | .false => "." <+> mapRowAux v s k (t + 1))
+def mapRowsAux (v : Nat) : Nat → Nat → String
+  | .zero, _ => ""
+  | .succ k, s => "  s" <+> Hdl.show s <+> " " <+> mapRowAux v s 32 0 <+> "\n" <+> mapRowsAux v k (s + 1)
+def mapRows (v : Nat) : String := mapRowsAux v 8 0
+
 def showOut (o : HwTy.El TbOut.code) : String :=
   let ω v := Bundle.ofEl TbOut.bundle o;
   "calDone=" <+> Hdl.show v.calDone.toNat <+> " calFail=" <+> Hdl.show v.calFail.toNat
@@ -94,8 +106,39 @@ def showOut (o : HwTy.El TbOut.code) : String :=
   <+> "\nfirst mismatch: cycle=" <+> Hdl.show v.badAt.toNat <+> " index=" <+> Hdl.show v.badIdx.toNat
   <+> "\n  got=" <+> Hdl.show v.badGot.toNat <+> "\n  exp=" <+> Hdl.show v.badExp.toNat
   <+> "\nserialisation mismatches=" <+> Hdl.show v.serBad.toNat
+  <+> "\nM0 " <+> hexS 64 v.map0.toNat <+> "\nM1 " <+> hexS 64 v.map1.toNat
+  <+> "\nMPR done=" <+> Hdl.show v.xDone.toNat <+> " fail=" <+> Hdl.show v.xFail.toNat
+  <+> "\nX0 " <+> hexS 64 v.xm0.toNat <+> "\nX1 " <+> hexS 64 v.xm1.toNat
+  <+> "\nXRO " <+> hexS 32 v.xro.toNat <+> "\nXRA " <+> hexS 32 v.xra.toNat
+  <+> "\nDQS seen high/never low=" <+> Hdl.show v.dqsOr.toNat <+> "/" <+> Hdl.show v.dqsAnd.toNat
 
 def simRun (n : Nat) (mp : MParams) : EIO Unit := say (showOut (Tb.run Timing.sim mp n))
+def simTrainRun (n : Nat) (mp : MParams) : EIO Unit := say (showOut (Tb.runTrain Timing.sim mp n))
+def simMprRun (n : Nat) (mp : MParams) : EIO Unit := say (showOut (Tb.runMpr Timing.sim mp n))
+
+-- The tap/slip sweep across device variants: the same calibration run, with the model's
+-- read latency, bit offset and per-lane good-tap windows moved. Prints the chosen
+-- (slip, tap, latency), the map rows ('#' good) and the traffic result.
+def sweepOne (n : Nat) (name : String) (mp : MParams) : EIO Unit := do
+  let o := Tb.run Timing.sim mp n;
+  let ω v := Bundle.ofEl TbOut.bundle o;
+  say (name <+> ": lat=" <+> Hdl.show mp.lat <+> " off=" <+> Hdl.show mp.off
+    <+> " good0=" <+> Hdl.show mp.lo0 <+> ".." <+> Hdl.show mp.hi0
+    <+> " good1=" <+> Hdl.show mp.lo1 <+> ".." <+> Hdl.show mp.hi1);
+  say ("  calDone=" <+> Hdl.show v.calDone.toNat <+> " calFail=" <+> Hdl.show v.calFail.toNat
+    <+> " tap0=" <+> Hdl.show v.tap0.toNat <+> " slip0=" <+> Hdl.show v.slip0.toNat
+    <+> " tap1=" <+> Hdl.show v.tap1.toNat <+> " slip1=" <+> Hdl.show v.slip1.toNat
+    <+> " lat=" <+> Hdl.show v.lat.toNat <+> " mismatch=" <+> Hdl.show v.bad.toNat);
+  say (mapRows v.map0.toNat);
+  say (mapRows v.map1.toNat)
+
+def sweepCases : List (String × MParams) :=
+  .cons ("default (lat 6, off 3)", MParams.mk 6 3 9 22 12 27)
+  (.cons ("early (lat 4, off 0)", MParams.mk 4 0 4 18 10 26)
+  (.cons ("late (lat 7, off 6)", MParams.mk 7 6 2 16 0 14)
+  (.cons ("narrow eye (lat 5, off 1)", MParams.mk 5 1 14 20 14 20)
+  (.cons ("dead lane 0", MParams.mk 6 3 31 0 12 27) .nil))))
+def sweepRun (n : Nat) : EIO Unit := EIO.forEach (fun (p : String × MParams) => sweepOne n p.1 p.2) sweepCases
 
 def showC (o : HwTy.El CTbOut.code) : String :=
   let ω v := Bundle.ofEl CTbOut.bundle o;
@@ -115,6 +158,9 @@ def mpOf : List String → MParams
 -- gen, bit
 
 def design : Netlist := Circuit.netlist "memtest" (Board.memtestC Timing.arty 24 866)
+-- the diagnostic boards: normal timing plus the MPR read sweep, and MPR only
+def designTrain : Netlist := Circuit.netlist "memtest_train" (Board.memtestTrainC Timing.arty 24 866)
+def designMpr : Netlist := Circuit.netlist "memtest_mpr" (Board.memtestMprC Timing.arty 24 866)
 def probeNet : Netlist := Circuit.netlist "probe" (Probe.circuit 866)
 
 -- primitive instances by module name
@@ -129,16 +175,19 @@ def cellCounts : List NetNode → List (String × Nat) → List (String × Nat)
     | .inst p => bump p.name acc
     | _ => acc)
 
-def gen : EIO Unit := do
+def genNamed (name : String) (n : Netlist) : EIO Unit := do
   ensureDir "build";
-  let n := design;
-  say ("memtest: " <+> Hdl.show (Netlist.size n) <+> " netlist nodes, " <+> Hdl.show (List.length n.regs) <+> " registers");
+  say (name <+> ": " <+> Hdl.show (Netlist.size n) <+> " netlist nodes, " <+> Hdl.show (List.length n.regs) <+> " registers");
   (match n.errors with
     | .nil => EIO.pure ()
     | es => EIO.fail ("netlist errors: " <+> unwords es));
   say ("  cells: " <+> unwords (Hdl.map (fun (p : String × Nat) => p.1 <+> "×" <+> Hdl.show p.2) (cellCounts n.nodes .nil)));
-  FS.writeFile (build "memtest.v") (Verilog.emitTop n Board.clocking);
-  FS.writeFile (build "memtest.xdc") Board.xdc
+  FS.writeFile (build (name <+> ".v")) (Verilog.emitTop n Board.clocking);
+  FS.writeFile (build (name <+> ".xdc")) Board.xdc
+
+def gen : EIO Unit := genNamed "memtest" design
+def genTrain : EIO Unit := genNamed "memtest_train" designTrain
+def genMpr : EIO Unit := genNamed "memtest_mpr" designMpr
 
 structure Dirs where
   chipdb : String
@@ -202,7 +251,7 @@ def pnr (dirs : Dirs) (d : Arty.Device) (name : String) : EIO Unit := do
   tool "nextpnr-xilinx" (.cons "--chipdb" (.cons (dirs.chipdb <+> "/" <+> Arty.Device.chipdb d <+> ".bin")
     (.cons "--xdc" (.cons (build "memtest.xdc") (.cons "--json" (.cons (build (name <+> ".json"))
     (.cons "--fasm" (.cons (dev d (name <+> ".fasm")) (.cons "--log" (.cons (dev d (name <+> ".nextpnr.log"))
-    (.cons "-q" .nil)))))))))));
+    (.cons "--seed" (.cons "3" (.cons "-q" .nil)))))))))))));
   lg ← FS.readFile (dev d (name <+> ".nextpnr.log"));
   say (name <+> " on " <+> Arty.Device.part d <+> ": timing (nextpnr)");
   -- (nextpnr reports after placement and twice after routing: the last one counts)
@@ -219,7 +268,7 @@ def pnrX (dirs : Dirs) (d : Arty.Device) (name xdc : String) : EIO Unit := do
   tool "nextpnr-xilinx" (.cons "--chipdb" (.cons (dirs.chipdb <+> "/" <+> Arty.Device.chipdb d <+> ".bin")
     (.cons "--xdc" (.cons (build xdc) (.cons "--json" (.cons (build (name <+> ".json"))
     (.cons "--fasm" (.cons (dev d (name <+> ".fasm")) (.cons "--log" (.cons (dev d (name <+> ".nextpnr.log"))
-    (.cons "-q" .nil)))))))))));
+    (.cons "--seed" (.cons "3" (.cons "-q" .nil)))))))))))));
   lg ← FS.readFile (dev d (name <+> ".nextpnr.log"));
   say (name <+> " on " <+> Arty.Device.part d <+> ": timing (nextpnr)");
   -- (nextpnr reports after placement and twice after routing: the last one counts)
@@ -260,6 +309,15 @@ def bit (dirs : Dirs) : EIO Unit := do
   ensureDir (build "a35t");
   pnr dirs Arty.Device.default "memtest"
 
+def bitNamed (dirs : Dirs) (name : String) (g : EIO Unit) : EIO Unit := do
+  g;
+  synth name;
+  ensureDir (build "a35t");
+  pnrX dirs Arty.Device.default name (name <+> ".xdc")
+
+def bitTrain (dirs : Dirs) : EIO Unit := bitNamed dirs "memtest_train" genTrain
+def bitMpr (dirs : Dirs) : EIO Unit := bitNamed dirs "memtest_mpr" genMpr
+
 ------------------------------------------------------------------------------------
 -- vsim: the memory test's core with short waits (Timing.sim), 2^8 bursts and 16 cycles per
 -- UART bit, against Micron's model (micron/, local only) in Icarus Verilog, with Xilinx's
@@ -297,7 +355,7 @@ def vsim : EIO Unit := do
 ------------------------------------------------------------------------------------
 -- The command line
 
-def usage : String := "usage: ddr3 sim [CYCLES [LAT OFF LO0 HI0 LO1 HI1]] | csim [CYCLES ...] | gen | bit | vsim  [--chipdb DIR] [--db DIR]"
+def usage : String := "usage: ddr3 sim|simtrain|mprsim [CYCLES [LAT OFF LO0 HI0 LO1 HI1]] | sweep [CYCLES] | csim [CYCLES ...] | gen|gentrain|genmpr | bit|bittrain|bitmpr | vsim  [--chipdb DIR] [--db DIR]"
 
 def envOr (k : String) (v : Option String) : EIO String := match v with
   | .some x => EIO.pure x
@@ -342,18 +400,37 @@ def runArgs (a : Args) : EIO Unit := match a.words with
       | .nil => simRun 4000 MParams.default)
     | _, .true, _ => gen
     | _, _, .true => EIO.bind (dirsOf a) bit
-    | _, _, _ => (match String.eq cmd "vsim" with
-      | .true => vsim
-      | .false => match String.eq cmd "probe" with
-      | .true => EIO.bind (dirsOf a) probe
-      | .false => match String.eq cmd "probe2" with
-      | .true => EIO.bind (dirsOf a) probe2
-      | .false => match String.eq cmd "cachegen" with
-      | .true => cachegen
-      | .false => match String.eq cmd "csim", rest with
-        | .true, .cons w ps => csimRun (natOf w) (mpOf ps)
-        | .true, .nil => csimRun 4000 MParams.default
-        | .false, _ => EIO.fail usage))
+    | _, _, _ => (match String.eq cmd "simtrain" with
+      | .true => (match rest with
+        | .cons w ps => simTrainRun (natOf w) (mpOf ps)
+        | .nil => simTrainRun 50000 MParams.default)
+      | .false => match String.eq cmd "mprsim" with
+      | .true => (match rest with
+        | .cons w ps => simMprRun (natOf w) (mpOf ps)
+        | .nil => simMprRun 50000 MParams.default)
+      | .false => match String.eq cmd "sweep", rest with
+        | .true, .cons w _ => sweepRun (natOf w)
+        | .true, .nil => sweepRun 30000
+        | .false, _ => match String.eq cmd "vsim" with
+        | .true => vsim
+        | .false => match String.eq cmd "probe" with
+        | .true => EIO.bind (dirsOf a) probe
+        | .false => match String.eq cmd "probe2" with
+        | .true => EIO.bind (dirsOf a) probe2
+        | .false => match String.eq cmd "cachegen" with
+        | .true => cachegen
+        | .false => match String.eq cmd "gentrain" with
+        | .true => genTrain
+        | .false => match String.eq cmd "genmpr" with
+        | .true => genMpr
+        | .false => match String.eq cmd "bittrain" with
+        | .true => EIO.bind (dirsOf a) bitTrain
+        | .false => match String.eq cmd "bitmpr" with
+        | .true => EIO.bind (dirsOf a) bitMpr
+        | .false => match String.eq cmd "csim", rest with
+          | .true, .cons w ps => csimRun (natOf w) (mpOf ps)
+          | .true, .nil => csimRun 4000 MParams.default
+          | .false, _ => EIO.fail usage))
   | .nil => EIO.fail usage
 
 def run (args : List String) : EIO Unit := match parse args .word (Args.mk .nil .none .none) with
