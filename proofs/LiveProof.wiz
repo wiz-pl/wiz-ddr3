@@ -1,0 +1,227 @@
+import Ddr3.Ctrl
+-- Scheduler liveness: a request offered continuously is accepted within a bounded
+-- number of controller cycles, under the documented refresh and port assumptions.
+-- Safety (no JEDEC rule is broken, and a pending refresh waits at most 18 cycles) is
+-- `proofs/SchedProof.wiz`; this file is the service half.  Nothing here proves the
+-- PHY, calibration, the cache, or the board.
+--
+-- The machine is the scheduler of the controller (`Sched.step`, the function `Ctrl.step`
+-- calls) in service (`on = 1`), with the control state (sst, stimer, swe, refPend) as
+-- numbers.  The request input is the worst case for service: `valid = 1` every cycle
+-- and `we` arbitrary (`we = 1` is a write, the longer access).  A request held valid is
+-- a special case, because the step does not depend on which request it is.
+--
+-- REFRESH ASSUMPTION.  `refDue` is not arbitrary: it is derived from the controller's
+-- refresh counter `refCnt`, which in service counts down and reloads with `tREFI - 1`
+-- (`Ctrl.step`).  It is therefore one cycle wide and at least `tREFI = 780` controller
+-- cycles apart.  The proof below assumes the weaker schedule "two due pulses are at
+-- least `LP.K = 32` cycles apart" (`LP.gap` is the automaton for that assumption:
+-- a pulse reloads it with 31, and it decrements; a pulse is possible only at 0, and
+-- may be postponed).  32 is enough to keep a pulse from arriving during a refresh:
+-- a due pulse is served at the first idle cycle, tRFC = 16 cycles, and the access in
+-- front of it is at most 9 cycles, so 32 > 9 + 16 + margin.  The real 780-cycle
+-- schedule is one of the schedules the theorem quantifies over.
+--
+-- FAIRNESS.  `valid` is held (or re-offered) every cycle; there is no assumption on
+-- `we` or on the addresses.  Refresh is not assumed fair: a due pulse *may* be
+-- postponed for ever in the abstraction (the scheduler still serves the pending one,
+-- and `SchedProof.SP.safe` bounds that wait at 18 cycles); the bound below also covers
+-- the worst pulse placement, so it does not rely on refresh fairness.
+--
+-- The proof is a finite-state check by evaluation, as in `SchedProof`: the reachable
+-- states are enumerated (BFS), and for every reachable state a bounded bad-set
+-- iteration shows that no input sequence of length `LP.B` avoids `ready`.  Then the
+-- set is an invariant (`Mealy.invariant`), so it holds at every cycle of every trace.
+
+def LP.t : Timing := Timing.arty
+-- the minimum spacing of refresh-due pulses the proof assumes (tREFI = 780 is the real
+-- one; see the header)
+def LP.K : Nat := 32
+-- the service bound: every reachable state is ready (accepts the offered request)
+-- within 25 controller cycles, i.e. in every window of 26 cycles
+def LP.B : Nat := 25
+-- the cap on the abstract refresh timer: gap = 0 may fire, 1..31 may not
+def LP.gapMax : Nat := LP.K - 1
+
+-- the scheduler control state as numbers, plus the refresh-timer automaton
+structure LS where
+  sst : Nat
+  stimer : Nat
+  swe : Nat
+  refPend : Nat
+  gap : Nat
+
+def LP.base : St HwTy.El := Bundle.ofEl St.bundle (Ctrl.init LP.t)
+
+-- the scheduler's `St`, with the control state replaced by `s` and the rest at the
+-- initial value (only the scheduler reads these fields)
+def LP.st (s : LS) : St HwTy.El :=
+  St.mk (LP.base).phase (LP.base).timer (LP.base).step (LP.base).rstN (LP.base).cke (LP.base).ras (LP.base).cas (LP.base).wen (LP.base).ba (LP.base).a
+    (BitVec.ofNat 2 s.sst) (BitVec.ofNat 8 s.stimer) (BitVec.ofNat 1 s.swe) (LP.base).sba (LP.base).srow (LP.base).scol (LP.base).wdata (LP.base).wdm (LP.base).refCnt (BitVec.ofNat 1 s.refPend) (LP.base).wrHist (LP.base).rdHist (LP.base).prevRaw (LP.base).prevAl0 (LP.base).prevAl1 (LP.base).cst (LP.base).ctap (LP.base).cwin (LP.base).hits0 (LP.base).hits1 (LP.base).lat0 (LP.base).lat1 (LP.base).map0 (LP.base).map1 (LP.base).cpos (LP.base).run0s (LP.base).run0l (LP.base).run1s (LP.base).run1l (LP.base).best0s (LP.base).best0l (LP.base).best0p (LP.base).best1s (LP.base).best1l (LP.base).best1p (LP.base).slip0 (LP.base).slip1 (LP.base).tap0 (LP.base).tap1 (LP.base).latR (LP.base).dly0 (LP.base).dly1 (LP.base).calDone (LP.base).calFail (LP.base).dlyLd (LP.base).cw (LP.base).ctry
+
+def LP.bit (b : Bool) : HwTy.El Bit := Bool.toBits b
+-- the request: valid every cycle, the write flag from the input, address and data
+-- irrelevant to the scheduler's timing
+def LP.req (we : Bool) : Req HwTy.El :=
+  Req.mk (LP.bit .true) (LP.bit we) (BitVec.ofNat 24 0) (BitVec.ofNat 128 0) (BitVec.ofNat 16 0)
+
+-- the refresh-timer automaton: a pulse is allowed at 0; after one it is 31 again, and
+-- it may also wait at 0 (a longer spacing, never a shorter one)
+def LP.gapNext (gap : Nat) (refDue : Bool) : Nat :=
+  match refDue with
+  | .true => LP.gapMax
+  | .false => match Nat.beq gap 0 with
+    | .true => 0
+    | .false => gap - 1
+
+-- one cycle: the scheduler step, then the timer.  The request is `valid = 1`; the
+-- output `LP.accept` is the port's `ready` (accept = ready and valid).
+def LP.next (s : LS) (x : Bool × Bool) : LS :=
+  let hit := x.1;
+  let we := x.2;
+  let refDue := Bool.and (Nat.beq s.gap 0) hit;
+  let sn := Sched.step LP.t (LP.st s) (LP.bit .true) (LP.bit refDue) (LP.req we);
+  LS.mk (BitVec.toNat sn.sst) (BitVec.toNat sn.stimer) (BitVec.toNat sn.swe)
+    (BitVec.toNat sn.refPend) (LP.gapNext s.gap refDue)
+
+-- `ready`: the scheduler is idle and no refresh is pending (then `accept = ready & valid`,
+-- and valid is 1).  This is `Ctrl.step`'s `ready` in service.
+def LP.accept (s : LS) : Bool := Bool.and (Nat.beq s.sst 0) (Nat.beq s.refPend 0)
+
+def LP.step (s : LS) (x : Bool × Bool) : LS × Bool := (LP.next s x, LP.accept s)
+def LP.M : Mealy LS (Bool × Bool) Bool := LP.step
+def LP.init : LS := LS.mk 0 0 0 0 0
+
+-- the input alphabet: (refresh always postponed / allowed, read / write)
+def LP.inputs : List (Bool × Bool) :=
+  .cons (Bool.false, Bool.false) (.cons (Bool.false, Bool.true)
+    (.cons (Bool.true, Bool.false) (.cons (Bool.true, Bool.true) .nil)))
+
+------------------------------------------------------------------------------------
+-- Decidable equality of states
+
+def LP.bEq (a b : Bool) : Bool := match a, b with
+  | .true, .true => .true
+  | .false, .false => .true
+  | _, _ => .false
+def LP.bEq_sound : (a b : Bool) → LP.bEq a b = .true → a = b
+  | .true, .true, e => rfl
+  | .false, .false, e => rfl
+  | .true, .false, e => absurd e.1
+  | .false, .true, e => absurd e.1
+def LP.nEq_sound : (a b : Nat) → Nat.beq a b = .true → a = b
+  | .zero, .zero, e => rfl
+  | .zero, .succ b, e => absurd e.1
+  | .succ a, .zero, e => absurd e.1
+  | .succ a, .succ b, e => Eq.congrArg Nat.succ (LP.nEq_sound a b e)
+
+def LP.and_l : (a b : Bool) → Bool.and a b = .true → a = .true
+  | .true, _, e => rfl
+  | .false, _, e => absurd e.1
+def LP.and_r : (a b : Bool) → Bool.and a b = .true → b = .true
+  | .true, _, e => e
+  | .false, _, e => absurd e.1
+def LP.or_cases : (a b : Bool) → Bool.or a b = .true → a = .true ∨ b = .true
+  | .true, _, e => Or.inl rfl
+  | .false, b, e => Or.inr e
+def LP.not_true : (a : Bool) → Bool.not a = .true → a = .false
+  | .false, e => rfl
+  | .true, e => absurd e.1
+def LP.not_false : (a : Bool) → Bool.not a = .false → a = .true
+  | .true, e => rfl
+  | .false, e => absurd e.1
+
+def LS.eqB (a b : LS) : Bool :=
+  Bool.and (Nat.beq a.sst b.sst) (Bool.and (Nat.beq a.stimer b.stimer)
+    (Bool.and (Nat.beq a.swe b.swe) (Bool.and (Nat.beq a.refPend b.refPend) (Nat.beq a.gap b.gap))))
+def LS.eqB_sound (a b : LS) (e : LS.eqB a b = .true) : a = b :=
+  let e1 := LP.nEq_sound a.sst b.sst (LP.and_l _ _ e);
+  let r1 := LP.and_r _ _ e;
+  let e2 := LP.nEq_sound a.stimer b.stimer (LP.and_l _ _ r1);
+  let r2 := LP.and_r _ _ r1;
+  let e3 := LP.nEq_sound a.swe b.swe (LP.and_l _ _ r2);
+  let r3 := LP.and_r _ _ r2;
+  let e4 := LP.nEq_sound a.refPend b.refPend (LP.and_l _ _ r3);
+  let e5 := LP.nEq_sound a.gap b.gap (LP.and_r _ _ r3);
+  Eq.trans (Eq.congrArg (fun (x : Nat) => LS.mk x a.stimer a.swe a.refPend a.gap) e1)
+    (Eq.trans (Eq.congrArg (fun (x : Nat) => LS.mk b.sst x a.swe a.refPend a.gap) e2)
+    (Eq.trans (Eq.congrArg (fun (x : Nat) => LS.mk b.sst b.stimer x a.refPend a.gap) e3)
+    (Eq.trans (Eq.congrArg (fun (x : Nat) => LS.mk b.sst b.stimer b.swe x a.gap) e4)
+      (Eq.congrArg (fun (x : Nat) => LS.mk b.sst b.stimer b.swe b.refPend x) e5))))
+
+------------------------------------------------------------------------------------
+-- The reachable states: breadth first, by evaluation
+
+def LP.mem (s : LS) : List LS → Bool
+  | .nil => .false
+  | .cons x xs => Bool.or (LS.eqB s x) (LP.mem s xs)
+def LP.add (s : LS) (L : List LS) : List LS := .cons s L
+
+def LP.succs (s : LS) : List LS := Hdl.map (fun (x : Bool × Bool) => LP.next s x) LP.inputs
+
+def LP.visit : List LS → List LS → List LS → List LS × List LS
+  | .nil, seen, next => (seen, next)
+  | .cons x xs, seen, next => match LP.mem x seen with
+    | .true => LP.visit xs seen next
+    | .false => LP.visit xs (LP.add x seen) (.cons x next)
+def LP.expand : List LS → List LS → List LS → List LS × List LS
+  | .nil, seen, next => (seen, next)
+  | .cons s ss, seen, next =>
+    let r := LP.visit (LP.succs s) seen next;
+    LP.expand ss r.1 r.2
+def LP.bfs : Nat → List LS → List LS → List LS
+  | .zero, seen, _ => seen
+  | .succ k, seen, frontier => match frontier with
+    | .nil => seen
+    | .cons _ _ =>
+      let r := LP.expand frontier seen .nil;
+      LP.bfs k r.1 r.2
+def LP.reach : List LS := LP.bfs 1000 (.cons LP.init .nil) (.cons LP.init .nil)
+def LP.count : Nat := List.length LP.reach
+
+def LP.all (f : LS → Bool) : List LS → Bool
+  | .nil => .true
+  | .cons x xs => Bool.and (f x) (LP.all f xs)
+
+-- the state's four successors are in the reachable set
+def LP.closedAt (s : LS) : Bool :=
+  Bool.and (LP.mem (LP.next s (Bool.false, Bool.false)) LP.reach)
+    (Bool.and (LP.mem (LP.next s (Bool.false, Bool.true)) LP.reach)
+      (Bool.and (LP.mem (LP.next s (Bool.true, Bool.false)) LP.reach)
+                (LP.mem (LP.next s (Bool.true, Bool.true)) LP.reach)))
+def LP.closed : Bool := LP.all LP.closedAt LP.reach
+
+------------------------------------------------------------------------------------
+-- Bounded bad sets: `badGo k` holds the reachable states from which some sequence of
+-- k inputs has no `ready` at any of the k+1 cycles (0..k).  `avoid` is the same
+-- predicate written recursively (the specification the proof reasons about).
+
+def LP.keep (p : LS → Bool) : List LS → List LS
+  | .nil => .nil
+  | .cons x xs => match p x with
+    | .true => .cons x (LP.keep p xs)
+    | .false => LP.keep p xs
+
+def LP.avoid : Nat → LS → Bool
+  | .zero, s => Bool.not (LP.accept s)
+  | .succ k, s => Bool.and (Bool.not (LP.accept s))
+      (Bool.or (LP.avoid k (LP.next s (Bool.false, Bool.false)))
+        (Bool.or (LP.avoid k (LP.next s (Bool.false, Bool.true)))
+          (Bool.or (LP.avoid k (LP.next s (Bool.true, Bool.false)))
+                    (LP.avoid k (LP.next s (Bool.true, Bool.true))))))
+
+def LP.badGo : Nat → List LS
+  | .zero => LP.keep (fun (s : LS) => Bool.not (LP.accept s)) LP.reach
+  | .succ k => LP.keep (fun (s : LS) => Bool.and (Bool.not (LP.accept s))
+      (Bool.or (LP.mem (LP.next s (Bool.false, Bool.false)) (LP.badGo k))
+        (Bool.or (LP.mem (LP.next s (Bool.false, Bool.true)) (LP.badGo k))
+          (Bool.or (LP.mem (LP.next s (Bool.true, Bool.false)) (LP.badGo k))
+                    (LP.mem (LP.next s (Bool.true, Bool.true)) (LP.badGo k)))))) LP.reach
+
+def LP.check : Bool := LP.all (fun (s : LS) => Bool.not (LP.mem s (LP.badGo LP.B))) LP.reach
+def LP.badCount : Nat := List.length (LP.badGo LP.B)
+
+#eval LP.count
+#eval LP.badCount
+#eval LP.closed
+#eval LP.check
